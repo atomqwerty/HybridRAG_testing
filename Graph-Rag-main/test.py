@@ -1,15 +1,9 @@
-from openai import OpenAI
+# importing os module for environment variables
+import os
+# importing necessary functions from dotenv library
+from dotenv import load_dotenv, dotenv_values 
+# loading variables from .env file
+load_dotenv() 
 
-client = OpenAI(
-    api_key="sk-XvTQznrYLhoYfh2km9YG_w",
-    base_url="https://aigateway.ntictsolution.com/v1"
-)
-
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[
-        {"role": "user", "content": "Hello from normal Python code"}
-    ]
-)
-
-print(response.choices[0].message.content)
+# accessing and printing value
+print(os.getenv("OpenAi_api"))
