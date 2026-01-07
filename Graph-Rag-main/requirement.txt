@@ -25,4 +25,4 @@ requests
 tenacity
 PyYAML
 SQLAlchemy
-numpy<2.0
+numpy
