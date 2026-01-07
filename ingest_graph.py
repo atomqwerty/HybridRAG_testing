@@ -71,11 +71,7 @@ def enrich_communities(graph):
             CALL gds.graph.project(
                 'communityGraph',
                 'Entity',
-                {
-                    RELATED_TO: {
-                        orientation: 'UNDIRECTED'
-                    }
-                }
+                '*'
             )
         """)
         
@@ -126,6 +122,29 @@ def create_indexes(graph):
     except Exception as e:
         print(f"   ⚠️ Fulltext index error: {e}")
 
+def get_combined_chunks(docs, chunks_to_combine=3):
+    """
+    Combines multiple chunks into a single document to provide more context 
+    to the LLM during extraction.
+    """
+    combined = []
+    print(f"   - Combining chunks (Group Size: {chunks_to_combine})...")
+    
+    for i in range(0, len(docs), chunks_to_combine):
+        batch = docs[i : i + chunks_to_combine]
+        
+        # Join content with newlines
+        combined_content = "\n\n".join([d.page_content for d in batch])
+        combined_ids = [d.metadata['id'] for d in batch]
+        
+        new_doc = Document(
+            page_content=combined_content,
+            metadata={"combined_chunk_ids": combined_ids}
+        )
+        combined.append(new_doc)
+    
+    return combined
+
 def ingest_data():
     print("🚀 Starting ULTIMATE Hybrid RAG Data Ingestion...")
     
@@ -160,7 +179,7 @@ def ingest_data():
     print("\n📂 Loading & Chunking Documents...")
     pdf_files = glob.glob("data/*.pdf")
     if not pdf_files:
-        print("⚠️ No PDF files found in 'Graph-Rag-main/data/'.")
+        print("⚠️ No PDF files found in 'data/'.")
         return
 
     docs = []
@@ -209,41 +228,83 @@ def ingest_data():
     create_indexes(graph)
 
     # --- 5. Extract Graph (LLM) ---
-    print("\n🕸️ Extracting Graph Knowledge...")
+    print("\n🕸️ Extracting Graph Knowledge (with Chunk Combination)...")
     
-    # Specific instructions to improve quality
-    extraction_prompt = "Focus on Formula 1. Extract Drivers, Teams, Cars, Engines, and Races. Ignore generic car terms."
+    # Combine chunks to give LLM better context
+    combined_docs = get_combined_chunks(chunks_with_metadata, chunks_to_combine=3)
     
+    # Configuration for Extraction
+    # Can be set in .env. If "OPEN", extraction is unrestricted.
+    env_nodes = os.getenv('ALLOWED_NODES')
+    env_rels = os.getenv('ALLOWED_RELATIONSHIPS')
+    
+    if env_nodes == "OPEN":
+        allowed_nodes = [] # Unrestricted
+        print("   - Strategy: Open Extraction (No Node Constraints)")
+    elif env_nodes:
+        allowed_nodes = [n.strip() for n in env_nodes.split(',') if n.strip()]
+        print(f"   - Strategy: Constrained Nodes: {allowed_nodes}")
+    else:
+        # Default to Open Extraction (Let LLM decide)
+        allowed_nodes = [] 
+        print(f"   - Strategy: Open Extraction (Auto-detect Nodes)")
+
+    if env_rels == "OPEN":
+        allowed_rels = [] # Unrestricted
+        print("   - Strategy: Open Extraction (No Relationship Constraints)")
+    elif env_rels:
+        allowed_rels = [r.strip() for r in env_rels.split(',') if r.strip()]
+        # Simple validation could go here later if needed
+        print(f"   - Strategy: Constrained Relationships: {allowed_rels}")
+    else:
+        # Default to Open Extraction (Let LLM decide)
+        allowed_rels = []
+        print(f"   - Strategy: Open Extraction (Auto-detect Relationships)")
+
     llm_transformer = LLMGraphTransformer(
         llm=llm,
-        allowed_nodes=["Person", "Team", "Car", "Engine", "Event", "Location", "Organization"],
-        allowed_relationships=["DRIVES_FOR", "LOCATED_IN", "USES_ENGINE", "WON_RACE", "PART_OF", "MANUFACTURED_BY", "TEAMMATE_OF"],
-        additional_instructions=extraction_prompt
+        allowed_nodes=allowed_nodes,
+        allowed_relationships=allowed_rels
     )
+    
+    # Process in Batches
+    BATCH_SIZE = 10
+    total_batches = (len(combined_docs) + BATCH_SIZE - 1) // BATCH_SIZE
 
-    for i, chunk in enumerate(chunks_with_metadata):
-        if i % 5 == 0: print(f"   - Processing batch {i}...")
+    for batch_idx in range(total_batches):
+        start = batch_idx * BATCH_SIZE
+        end = start + BATCH_SIZE
+        batch_combined = combined_docs[start:end]
         
-        # Convert single chunk
-        graph_docs = llm_transformer.convert_to_graph_documents([chunk])
+        print(f"   - Processing Batch {batch_idx + 1}/{total_batches} ({len(batch_combined)} combined docs)...")
         
-        if not graph_docs: continue
+        try:
+            graph_docs = llm_transformer.convert_to_graph_documents(batch_combined)
             
-        graph.add_graph_documents(graph_docs)
-        
-        # Link Entities to Source Chunk
-        for g_doc in graph_docs:
-            for node in g_doc.nodes:
-                graph.query("""
-                    MATCH (c:Chunk {id: $chunk_id})
-                    MERGE (e:Entity {id: $node_id})
-                    ON CREATE SET e.type = $node_type
-                    MERGE (c)-[:HAS_ENTITY]->(e)
-                """, {
-                    'chunk_id': chunk.metadata['id'],
-                    'node_id': node.id,
-                    'node_type': node.type
-                })
+            if not graph_docs: continue
+            
+            graph.add_graph_documents(graph_docs)
+            
+            # Link Entities to ALL Source Chunks
+            for g_doc in graph_docs:
+                # Get the list of chunk IDs this graph doc was derived from
+                chunk_ids = g_doc.source.metadata.get('combined_chunk_ids', [])
+                
+                for chunk_id in chunk_ids:
+                    for node in g_doc.nodes:
+                        graph.query("""
+                            MATCH (c:Chunk {id: $chunk_id})
+                            MERGE (e:Entity {id: $node_id})
+                            ON CREATE SET e.type = $node_type
+                            MERGE (c)-[:HAS_ENTITY]->(e)
+                        """, {
+                            'chunk_id': chunk_id,
+                            'node_id': node.id,
+                            'node_type': node.type
+                        })
+                    
+        except Exception as e:
+            print(f"   ⚠️ Error processing batch {batch_idx + 1}: {e}")
 
     # --- 6. Post-Processing ---
     clean_graph_schema(graph)
