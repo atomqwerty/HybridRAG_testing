@@ -27,9 +27,8 @@ embeddings = OpenAIEmbeddings(
      openai_api_key=os.getenv("OpenAi_api_embbeding")
 )
 
-# 4. Define Retrieval Functions
+# 4. Define Retrieval Function
 
-# 4. Define Retrieval Functions
 
 def create_fulltext_index(graph):
     """Creates a fulltext index on Entity nodes for better keyword search."""
