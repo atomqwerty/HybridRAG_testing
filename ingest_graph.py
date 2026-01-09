@@ -6,10 +6,13 @@ import time
 from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, PDFPlumberLoader, Docx2txtLoader, TextLoader, UnstructuredImageLoader, WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_experimental.graph_transformers import LLMGraphTransformer
+from langchain_experimental.text_splitter import SemanticChunker
 from langchain_core.documents import Document
+import pdfplumber
+from vision_utils import describe_image, encode_image_from_bytes, encode_image_from_file
 
 # Load environment variables
 load_dotenv()
@@ -156,6 +159,12 @@ def ingest_data():
             password=NEO4J_PASSWORD
         )
         print("✅ Connected to Neo4j")
+        
+        # Clear existing data for a fresh start with PDFPlumber
+        print("🧹 Clearing existing database to ensure clean table ingestion...")
+        graph.query("MATCH (n) DETACH DELETE n")
+        print("   ✅ Database cleared.")
+        
     except Exception as e:
         print(f"❌ Failed to connect to Neo4j: {e}")
         return
@@ -176,22 +185,160 @@ def ingest_data():
     )
 
     # --- 2. Load & Chunk ---
-    print("\n📂 Loading & Chunking Documents...")
-    pdf_files = glob.glob("data/*.pdf")
-    if not pdf_files:
-        print("⚠️ No PDF files found in 'data/'.")
+    print("\n📂 Loading & Chunking Documents (PDF, DOCX, TXT)...")
+    
+    # Get all files in data directory
+    all_files = glob.glob("data/*")
+    
+    docs = []
+    
+    for file_path in all_files:
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        try:
+            if ext == '.pdf':
+                print(f"   - Loading PDF (Multimodal): {os.path.basename(file_path)}")
+                
+                with pdfplumber.open(file_path) as pdf:
+                    for i, page in enumerate(pdf.pages):
+                        # 1. Extract Text (Table-aware)
+                        text = page.extract_text() or ""
+                        
+                        # 2. Extract Images (Charts/Graphs)
+                        image_descriptions = ""
+                        for img in page.images:
+                            # Filter small icons (e.g. logos)
+                            if img['width'] < 100 or img['height'] < 100: continue
+                            
+                            try:
+                                # Get image bytes
+                                img_obj = page.crop( (img['x0'], img['top'], img['x1'], img['bottom']) ).to_image()
+                                if img_obj.original.mode not in ('RGB', 'L'):
+                                    img_obj.original = img_obj.original.convert('RGB')
+                                
+                                # Convert to bytes compatible with our util
+                                import io
+                                buf = io.BytesIO()
+                                img_obj.original.save(buf, format="JPEG")
+                                img_bytes = buf.getvalue()
+                                
+                                # Describe
+                                print(f"      Possible Chart/Image on P{i+1}. Analyzing with Vision...")
+                                b64 = encode_image_from_bytes(img_bytes)
+                                desc = describe_image(b64)
+                                image_descriptions += desc
+                            except Exception as e_img:
+                                print(f"      ⚠️ Image processing failed: {e_img}")
+
+                        # 3. Create Document
+                        full_content = text + "\n" + image_descriptions
+                        doc = Document(
+                            page_content=full_content,
+                            metadata={"source": os.path.basename(file_path), "page": i+1}
+                        )
+                        docs.append(doc)
+                
+            elif ext == '.docx':
+                print(f"   - Loading DOCX: {os.path.basename(file_path)}")
+                try:
+                    loader = Docx2txtLoader(file_path)
+                    docs.extend(loader.load())
+                except ImportError:
+                     print("      ❌ Missing 'docx2txt'. Install it: `pip install docx2txt`")
+                     
+            elif ext == '.txt':
+                 print(f"   - Loading TXT: {os.path.basename(file_path)}")
+                 loader = TextLoader(file_path)
+                 docs.extend(loader.load())
+
+            elif ext in ['.png', '.jpg', '.jpeg']:
+                 print(f"   - Loading Image: {os.path.basename(file_path)}")
+                 b64 = encode_image_from_file(file_path)
+                 desc = describe_image(b64)
+                 doc = Document(
+                     page_content=f"[IMAGE FILE SOURCE: {os.path.basename(file_path)}]\n{desc}",
+                     metadata={"source": os.path.basename(file_path)}
+                 )
+                 docs.append(doc)
+                 
+            else:
+                pass # Skip unknown
+                
+        except Exception as e:
+            print(f"   ⚠️ Failed to load {file_path}: {e}")
+            
+    if not docs and not os.path.exists("data/urls.txt"):
+        print("❌ No documents or URLs found. Exiting.")
         return
 
-    docs = []
-    for pdf_file in pdf_files:
-        loader = PyPDFLoader(pdf_file)
-        docs.extend(loader.load())
+    # --- 2b. Load from Web (if urls.txt exists) ---
+    url_file = "data/urls.txt"
+    if os.path.exists(url_file):
+        print(f"\n🌐 Found {url_file}, loading websites...")
+        with open(url_file, "r") as f:
+            urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        
+        if urls:
+            try:
+                print(f"   - Scaping {len(urls)} URLs: {urls}")
+                loader = WebBaseLoader(urls)
+                web_docs = loader.load()
+                # Determine "Title" from metadata if possible, else use URL
+                for d in web_docs:
+                    d.metadata["source"] = d.metadata.get("source", d.metadata.get("url", "webpage"))
+                docs.extend(web_docs)
+                print(f"   ✅ Loaded {len(web_docs)} web pages.")
+            except Exception as e:
+                print(f"   ⚠️ Web loading failed: {e}")
+        else:
+            print("   (urls.txt is empty)")
+            
+    if not docs:
+        print("❌ No content loaded (files or web). Exiting.")
+        return
     
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
-    raw_chunks = text_splitter.split_documents(docs)
+    # --- Smart Chunking Logic ---
+    print("   (Applying Smart Hybrid Chunking: Tables -> Page-Based, Text -> Semantic Split)")
     
-    # Re-limit for safety/cost, remove in production
-    processed_chunks = raw_chunks[:100] 
+    def is_table_page(text):
+        """
+        Detects if a page looks like a table based on structural layout 
+        (multiple columns separated by whitespace).
+        """
+        lines = text.split('\n')
+        table_like_lines = 0
+        for line in lines:
+            # Check for at least 3 columns separated by 3+ spaces
+            columns = [c for c in line.split('   ') if c.strip()]
+            if len(columns) >= 3:
+                table_like_lines += 1
+        
+        # If >5 lines align like a table, treat page as a table
+        return table_like_lines >= 5
+
+    final_chunks = []
+    # Initialize Semantic Chunker for better narrative splitting
+    # "percentile" threshold works well for general text
+    semantic_splitter = SemanticChunker(embeddings, breakpoint_threshold_type="percentile")
+
+    for doc in docs:
+        if is_table_page(doc.page_content):
+            print(f"      - Page {doc.metadata.get('page', '?')}: Table detected. Keeping intact.")
+            final_chunks.append(doc)
+        else:
+            # Normal text page -> Semantic Split
+            try:
+                splits = semantic_splitter.split_documents([doc])
+                final_chunks.extend(splits)
+            except Exception as e:
+                print(f"      ⚠️ Semantic chunking failed on page {doc.metadata.get('page', '?')}, falling back to whole page: {e}")
+                final_chunks.append(doc)
+            
+    raw_chunks = final_chunks
+    
+    # Process ALL chunks for Production
+    processed_chunks = raw_chunks
+    # processed_chunks = raw_chunks[:100] # Uncomment for testing 
 
     # --- 3. Prepare Attributes (UUIDs + Embeddings) ---
     print(f"   - Processing {len(processed_chunks)} chunks...")
@@ -230,10 +377,10 @@ def ingest_data():
     # --- 5. Extract Graph (LLM) ---
     print("\n🕸️ Extracting Graph Knowledge (with Chunk Combination)...")
     
-    # Combine chunks to give LLM better context
-    combined_docs = get_combined_chunks(chunks_with_metadata, chunks_to_combine=3)
+    # Combine chunks (reduce groups to 2 for stability)
+    combined_docs = get_combined_chunks(chunks_with_metadata, chunks_to_combine=2)
     
-    # Configuration for Extraction
+     # Configuration for Extraction
     # Can be set in .env. If "OPEN", extraction is unrestricted.
     env_nodes = os.getenv('ALLOWED_NODES')
     env_rels = os.getenv('ALLOWED_RELATIONSHIPS')
@@ -267,8 +414,8 @@ def ingest_data():
         allowed_relationships=allowed_rels
     )
     
-    # Process in Batches
-    BATCH_SIZE = 10
+    # Process in Smaller Batches
+    BATCH_SIZE = 5
     total_batches = (len(combined_docs) + BATCH_SIZE - 1) // BATCH_SIZE
 
     for batch_idx in range(total_batches):
@@ -279,7 +426,9 @@ def ingest_data():
         print(f"   - Processing Batch {batch_idx + 1}/{total_batches} ({len(batch_combined)} combined docs)...")
         
         try:
+            print("      > Sending request to LLM (this may take 10-20s)...")
             graph_docs = llm_transformer.convert_to_graph_documents(batch_combined)
+            print("      > Received response from LLM.")
             
             if not graph_docs: continue
             
