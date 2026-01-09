@@ -3,6 +3,11 @@ from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
+# LCEL Imports
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
 # 1. Setup Environment
 load_dotenv()
 
@@ -68,45 +73,29 @@ def retrieve_graph_context(graph, llm, question: str, limit: int = 15) -> str:
 
     # 3. Lucene Query Construction (Term1 OR Term2~)
     # The ~ implies fuzzy matching
+    # 3. Lucene Query Construction
     lucene_query = " OR ".join([f"{term}~" for term in search_terms])
     
+    # improved structured retrieval query
     cypher_query = """
     CALL db.index.fulltext.queryNodes("entity_id_index", $query, {limit: 5})
     YIELD node, score
-    MATCH (node)-[r]-(connected)
-    RETURN node, type(r) as relation, connected, score
-    LIMIT $limit
+    CALL (node) {
+      MATCH (node)-[r:!HAS_ENTITY]->(neighbor)
+      RETURN node.id + ' --[' + type(r) + ']-> ' + neighbor.id AS output
+      UNION
+      MATCH (node)<-[r:!HAS_ENTITY]-(neighbor)
+      RETURN neighbor.id + ' --[' + type(r) + ']-> ' + node.id AS output
+    }
+    RETURN output LIMIT 50
     """
     
-    joined_context = []
-    
     try:
-        results = graph.query(cypher_query, {"query": lucene_query, "limit": limit})
+        results = graph.query(cypher_query, {"query": lucene_query})
+        return "\n".join([row['output'] for row in results])
     except Exception as e:
-        print(f"⚠️ Fulltext search failed, falling back to basic CONTAINS: {e}")
-        # Fallback to old method if index fails
-        fallback_results = []
-        for term in search_terms:
-            q_res = graph.query("""
-                MATCH (n:Entity)-[r]-(m:Entity)
-                WHERE toLower(n.id) CONTAINS toLower($term)
-                RETURN n as node, type(r) as relation, m as connected
-                LIMIT 5
-            """, {'term': term})
-            fallback_results.extend(q_res)
-        results = fallback_results
-
-    if not results:
+        print(f"⚠️ Graph search failed: {e}")
         return ""
-
-    for row in results:
-        s = row['node']
-        t = row['connected']
-        s_id = s.get('id', 'Unknown')
-        t_id = t.get('id', t.get('text', '')[:50] + "...")
-        joined_context.append(f"{s_id} --[{row['relation']}]--> {t_id}")
-
-    return "\n".join(set(joined_context)) # Remove duplicates
 
 
 
@@ -142,36 +131,99 @@ def hybrid_context(graph, embeddings, question):
     return context
 
 
-def answer(question):
-    """Final QA function."""
+def answer(question, history=""):
+    """Final QA function using LCEL."""
     print(f"🤔 Thinking about: {question}")
     
-    context = hybrid_context(graph, embeddings, question)
+    # --- Step 1: Condense Question (if history exists) ---
+    standalone_question = question
+    if history:
+        print("🤔 Rewriting question based on history...")
+        condense_template = """Given the chat history and a follow-up question, rephrase the follow-up question to be a standalone question.
+Chat History:
+{history}
+Follow Up Input: {question}
+Standalone question:"""
+        condense_prompt = ChatPromptTemplate.from_template(condense_template)
+        condense_chain = condense_prompt | llm | StrOutputParser()
+        standalone_question = condense_chain.invoke({"history": history, "question": question})
+        print(f"   ↳ Rewritten: {standalone_question}")
+
+    print(f"🤔 Thinking about: {standalone_question}")
     
-    # Optional: Print context to see what's retrieved
-    # print(f"\n[Context Retrieved]\n{context}\n")
+    # --- Step 2: Retrieve Context using Standalone Question ---
+    # We pass the string directly to the retriever now
+    context = hybrid_context(graph, embeddings, standalone_question)
     
-    prompt = f"""
-    You are an AI assistant answering questions based on a combined Knowledge Graph and Vector search.
-    Use ONLY the context provided below. If the answer is not in the context, say "I don't know".
+    # --- Step 3: Generate Answer ---
+    template = """You are an AI assistant answering questions based on a combined Knowledge Graph and Vector search.
+Answer in the same language as the user's question.
+Use ONLY the context provided below. Do NOT use outside knowledge.
+If the answer is not in the context, or if the context is ambiguous, state what is missing.
+If the question is completely unrelated to the provided context (e.g., general world knowledge), politely decline to answer.
 
-    CONTEXT:
-    {context}
+SPECIAL INSTRUCTION FOR TABLES:
+If the context contains tabular data (rows of text/numbers):
+1. Identify potential column headers (e.g., 'Points', 'Total', 'Revenue', 'Score').
+2. Align the values in each row to these headers.
+3. Be careful of footnote markers (e.g., a '2' or '[1]' appearing right after a number). '581 2' likely means '581' with footnote '2', not '5812'.
+4. Extract the value that mathematically or semantically matches the question.
 
-    QUESTION:
-    {question}
+HISTORY:
+{history}
 
-    ANSWER:
-    """
-    print(f"🤖 context: {context}")
-    response = llm.invoke(prompt)
-    return response.content
+CONTEXT:
+{context}
 
-# 5. Run it
+QUESTION:
+{question}
+
+ANSWER:"""
+
+    prompt = ChatPromptTemplate.from_template(template)
+    
+    # We construct the final chain manually for clarity
+    final_chain = (
+        prompt 
+        | llm 
+        | StrOutputParser()
+    )
+    
+    response = final_chain.invoke({
+        "history": history,
+        "context": context,
+        "question": standalone_question # Use the rewritten question here too
+    })
+    
+    # For debugging:
+    # print(f"🤖 Context Used:\n{context}\n")
+    
+    return response
+
+# 5. Run it (Interactive Mode)
 if __name__ == "__main__":
-    q = "what team is max drive for?"
-    result = answer(q)
-    print("\n-----------------")
-    print(f"🤖 Answer: {result}")
-    print("-----------------")
+    print("\n💬 Hybrid RAG Chatbot Initialized (with Memory). Type 'exit' to quit.\n")
     
+    chat_history_str = ""
+    
+    while True:
+        try:
+            q = input("User: ")
+            if q.lower() in ['exit', 'quit', 'q']:
+                print("Bye! 👋")
+                break
+                
+            if not q.strip(): continue # Skip empty
+            
+            result = answer(q, history=chat_history_str)
+            print(f"Bot: {result}\n")
+            print("-" * 50)
+            
+            # Update History (Keep last 3 turns to fit context)
+            chat_history_str += f"User: {q}\nBot: {result}\n"
+            
+        except KeyboardInterrupt:
+            print("\nBye! 👋")
+            break
+        except Exception as e:
+            print(f"❌ Error: {e}")
