@@ -17,7 +17,7 @@ def encode_image_from_bytes(image_bytes):
     """Encodes in-memory image bytes to base64."""
     return base64.b64encode(image_bytes).decode('utf-8')
 
-def describe_image(base64_image, prompt="Describe this image in detail. If it is a chart or table, extract the data."):
+def describe_image(base64_image, prompt="Describe this image in detail in English. If it contains text in another language, translate it to English. If it is a chart or table, extract the data."):
     """
     Sends detailed image description request to GPT-4o-Vision.
     Returns the text description.

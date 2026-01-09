@@ -33,10 +33,10 @@
     *   ตั้งค่า volumes ให้ตรงกับโฟลเดอร์ที่ต้องการ
     เช่น
     volumes:
-      - "C:/Users/Dashboard/Documents/Neo4j/data:/data"
-      - "C:/Users/Dashboard/Documents/Neo4j/logs:/logs"
-      - "C:/Users/Dashboard/Documents/Neo4j/import:/import"
-      - "C:/Users/Dashboard/Documents/Neo4j/plugins:/plugins"
+       "C:/Users/******/Neo4j/data:/data"
+       "C:/Users/******/Neo4j/logs:/logs"
+       "C:/Users/******/Neo4j/import:/import"
+       "C:/Users/******/Neo4j/plugins:/plugins"
 3.  **สร้าง Environment และติดตั้ง Library:**
 
 ```bash

@@ -109,7 +109,7 @@ def vector_retrieve(graph, embeddings, question, k=10):
     result = graph.query("""
         CALL db.index.vector.queryNodes('doc_embedding', $k, $embedding)
         YIELD node, score
-        RETURN node.text AS text, score
+        RETURN node.text AS text, node.source AS source, node.page AS page, score
     """, {"embedding": q_embedding, "k": k})
     
     return result
@@ -126,7 +126,13 @@ def hybrid_context(graph, embeddings, question):
     context += "\n### RELEVANT TEXT CHUNKS:\n"
     if vector_ctx:
         for row in vector_ctx:
-            context += f"- {row['text']}\n"
+            src = row.get('source', 'Unknown')
+            pg = row.get('page', '?')
+            # Clean up source path if full path
+            if src and os.path.sep in str(src):
+                src = str(src).split(os.path.sep)[-1]
+                
+            context += f"- {row['text']} [Source: {src}, Page: {pg}]\n"
     else:
         context += "No relevant text chunks found.\n"
 
@@ -157,12 +163,11 @@ Standalone question:"""
     # We pass the string directly to the retriever now
     context = hybrid_context(graph, embeddings, standalone_question)
     
-    # --- Step 2.5: Display Cited Images ---
+    # --- Step 2.5: Display Cited Images & Sources ---
     def display_images_from_context(text):
         paths = re.findall(r"\[IMAGE PATH: (.*?)\]", text)
         for p in paths:
             try:
-                # Remove Windows specific artifacts if any or whitespace
                 p = p.strip()
                 if os.path.exists(p):
                     print(f"🖼️ Opening relevant image: {p}")
@@ -170,7 +175,22 @@ Standalone question:"""
             except Exception as e:
                 print(f"⚠️ Could not display image {p}: {e}")
 
+    def display_sources_from_context(text):
+        # Find all sources
+        matches = re.findall(r"\[Source: (.*?), Page: (.*?)\]", text)
+        if matches:
+            unique_sources = set()
+            print("\n📚 Sources Used:")
+            for src, pg in matches:
+                # Create a composite key to avoid duplicate page refs if desired, or just list files
+                entry = f"   - {src} (Page {pg})"
+                if entry not in unique_sources:
+                    print(entry)
+                    unique_sources.add(entry)
+            print("")
+
     display_images_from_context(context)
+    display_sources_from_context(context)
     
     # --- Step 3: Generate Answer ---
     template = """You are an AI assistant answering questions based on a combined Knowledge Graph and Vector search.
