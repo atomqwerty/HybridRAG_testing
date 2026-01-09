@@ -1,8 +1,9 @@
 import os
 import glob
-import uuid
-import hashlib
 import time
+import hashlib
+import uuid
+from pathlib import Path
 from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -222,11 +223,17 @@ def ingest_data():
                                 img_obj.original.save(buf, format="JPEG")
                                 img_bytes = buf.getvalue()
                                 
+                                # --- SAVE LOCALLY ---
+                                img_filename = f"img_{uuid.uuid4().hex[:8]}.jpg"
+                                img_path = Path("data/extracted_images") / img_filename
+                                img_path.parent.mkdir(parents=True, exist_ok=True)
+                                img_obj.original.save(img_path, format="JPEG")
+                                
                                 # Describe
                                 print(f"      Possible Chart/Image on P{i+1}. Analyzing with Vision...")
                                 b64 = encode_image_from_bytes(img_bytes)
                                 desc = describe_image(b64)
-                                image_descriptions += desc
+                                image_descriptions += f"\n[IMAGE PATH: {img_path}]\n{desc}"
                             except Exception as e_img:
                                 print(f"      ⚠️ Image processing failed: {e_img}")
 
@@ -321,7 +328,8 @@ def ingest_data():
     # "percentile" threshold works well for general text
     semantic_splitter = SemanticChunker(embeddings, breakpoint_threshold_type="percentile")
 
-    for doc in docs:
+    for i, doc in enumerate(docs):
+        print(f"      - Chunking document {i+1}/{len(docs)}...", end='\r') # Dynamic progress line
         if is_table_page(doc.page_content):
             print(f"      - Page {doc.metadata.get('page', '?')}: Table detected. Keeping intact.")
             final_chunks.append(doc)

@@ -1,28 +1,12 @@
-# Core LangChain stack (PINNED – do not upgrade casually)
-langchain==0.2.16
-langchain-core==0.2.43
-langchain-community==0.2.16
-langchain-experimental==0.0.63
-langchain-text-splitters==0.2.4
-langsmith==0.1.147
-
-# OpenAI integration (function calling support)
-langchain-openai==0.1.7
-openai
-
-# Neo4j
+langchain
+langchain-community
+langchain-openai
+langchain-experimental
 neo4j
-
-# Document loading
-pypdf
-
-# Token counting
-tiktoken
-
-# HTTP / async deps (safe explicit)
-aiohttp
+python-dotenv
+pdfplumber
+pillow
+beautifulsoup4
+docx2txt
 requests
-tenacity
-PyYAML
-SQLAlchemy
-numpy
+tiktoken

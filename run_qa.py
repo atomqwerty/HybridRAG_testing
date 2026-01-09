@@ -1,4 +1,6 @@
 import os
+import re
+from PIL import Image
 from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -154,6 +156,21 @@ Standalone question:"""
     # --- Step 2: Retrieve Context using Standalone Question ---
     # We pass the string directly to the retriever now
     context = hybrid_context(graph, embeddings, standalone_question)
+    
+    # --- Step 2.5: Display Cited Images ---
+    def display_images_from_context(text):
+        paths = re.findall(r"\[IMAGE PATH: (.*?)\]", text)
+        for p in paths:
+            try:
+                # Remove Windows specific artifacts if any or whitespace
+                p = p.strip()
+                if os.path.exists(p):
+                    print(f"🖼️ Opening relevant image: {p}")
+                    Image.open(p).show()
+            except Exception as e:
+                print(f"⚠️ Could not display image {p}: {e}")
+
+    display_images_from_context(context)
     
     # --- Step 3: Generate Answer ---
     template = """You are an AI assistant answering questions based on a combined Knowledge Graph and Vector search.
