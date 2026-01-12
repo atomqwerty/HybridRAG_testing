@@ -1,3 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
 .env
-Graph-Rag-main/test.py
-test_openai.py
+.env.local
+
+# Neo4j
+neo4j/
+
+# Logs
+log/
+*.log
+
+# Data (optional - uncomment if you don't want to commit data files)
+# data/extracted_images/
+# data/*.pdf
+# data/*.docx
+
+# Node
+node_modules/
+frontend/build/
+frontend/.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+check_graph_stats.py
+check_image.py
+data/extracted_images

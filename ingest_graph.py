@@ -202,10 +202,34 @@ def ingest_data():
                 
                 with pdfplumber.open(file_path) as pdf:
                     for i, page in enumerate(pdf.pages):
-                        # 1. Extract Text (Table-aware)
+                        # 1. Extract Text
                         text = page.extract_text() or ""
                         
-                        # 2. Extract Images (Charts/Graphs)
+                        # 2. Extract Tables (The "Secret Weapon")
+                        tables = page.extract_tables()
+                        table_text = ""
+                        if tables:
+                            print(f"      📊 Found {len(tables)} table(s) on page {i+1}")
+                            for table in tables:
+                                # Convert table to Markdown format
+                                # Filter out None values and empty rows
+                                clean_table = [[cell or "" for cell in row] for row in table if any(row)]
+                                if clean_table:
+                                    # Create header and rows
+                                    try:
+                                        # Simple markdown conversion
+                                        header = "| " + " | ".join(clean_table[0]) + " |"
+                                        separator = "| " + " | ".join(["---"] * len(clean_table[0])) + " |"
+                                        body = "\n".join(["| " + " | ".join(row) + " |" for row in clean_table[1:]])
+                                        table_markdown = f"\n\n### TABLE DATA (Page {i+1}):\n{header}\n{separator}\n{body}\n"
+                                        table_text += table_markdown
+                                    except Exception as e:
+                                        print(f"      ⚠️ Could not format table: {e}")
+
+                        # Combine Text + Table Data
+                        final_content = text + "\n" + table_text
+                        
+                        # 3. Extract Images (Existing Logic)
                         image_descriptions = ""
                         for img in page.images:
                             # Filter small icons (e.g. logos)
@@ -232,7 +256,14 @@ def ingest_data():
                                 # Describe
                                 print(f"      Possible Chart/Image on P{i+1}. Analyzing with Vision...")
                                 b64 = encode_image_from_bytes(img_bytes)
-                                desc = describe_image(b64)
+                                
+                                # Save description to log directory
+                                log_dir = Path("log")
+                                if not log_dir.exists():
+                                    log_dir.mkdir(parents=True, exist_ok=True)
+                                desc_filename = img_path.stem + '_description.txt'
+                                desc_path = log_dir / desc_filename
+                                desc = describe_image(b64, save_description_path=str(desc_path))
                                 image_descriptions += f"\n[IMAGE PATH: {img_path}]\n{desc}"
                             except Exception as e_img:
                                 print(f"      ⚠️ Image processing failed: {e_img}")
@@ -261,9 +292,25 @@ def ingest_data():
             elif ext in ['.png', '.jpg', '.jpeg']:
                  print(f"   - Loading Image: {os.path.basename(file_path)}")
                  b64 = encode_image_from_file(file_path)
-                 desc = describe_image(b64)
+                 
+                 # Save description to log directory
+                 desc_filename = Path(file_path).stem + '_description.txt'
+                 log_dir = Path("log")
+                 if not log_dir.exists():
+                     log_dir.mkdir(parents=True, exist_ok=True)
+                 desc_path = log_dir / desc_filename
+                 desc = describe_image(b64, save_description_path=str(desc_path))
+                 
+                 # Store the image path relative to project root
+                 abs_file_path = Path(file_path).resolve()
+                 try:
+                     img_path = abs_file_path.relative_to(Path.cwd())
+                 except ValueError:
+                     # If relative_to fails, just use the file path as-is
+                     img_path = Path(file_path)
+                 
                  doc = Document(
-                     page_content=f"[IMAGE FILE SOURCE: {os.path.basename(file_path)}]\n{desc}",
+                     page_content=f"[IMAGE PATH: {img_path}]\n[IMAGE FILE SOURCE: {os.path.basename(file_path)}]\n{desc}",
                      metadata={"source": os.path.basename(file_path)}
                  )
                  docs.append(doc)
@@ -330,7 +377,12 @@ def ingest_data():
 
     for i, doc in enumerate(docs):
         print(f"      - Chunking document {i+1}/{len(docs)}...", end='\r') # Dynamic progress line
-        if is_table_page(doc.page_content):
+        
+        # Check if this is an image document (contains [IMAGE PATH:])
+        if '[IMAGE PATH:' in doc.page_content or '[IMAGE FILE SOURCE:' in doc.page_content:
+            print(f"      - Image document detected. Keeping intact: {doc.metadata.get('source', 'Unknown')}")
+            final_chunks.append(doc)
+        elif is_table_page(doc.page_content):
             print(f"      - Page {doc.metadata.get('page', '?')}: Table detected. Keeping intact.")
             final_chunks.append(doc)
         else:
@@ -369,6 +421,7 @@ def ingest_data():
             'id': chunk_id,
             'text': chunk.page_content,
             'source': source_file,
+            'page': chunk.metadata.get('page', None),
             'embedding': batch_emb[i]
         })
 
@@ -377,7 +430,7 @@ def ingest_data():
     graph.query("""
         UNWIND $batch AS data
         MERGE (c:Chunk {id: data.id})
-        SET c.text = data.text, c.source = data.source, c.embedding = data.embedding
+        SET c.text = data.text, c.source = data.source, c.page = data.page, c.embedding = data.embedding
     """, {'batch': chunk_data_for_cypher})
     
     create_indexes(graph)
@@ -385,8 +438,8 @@ def ingest_data():
     # --- 5. Extract Graph (LLM) ---
     print("\n🕸️ Extracting Graph Knowledge (with Chunk Combination)...")
     
-    # Combine chunks (reduce groups to 2 for stability)
-    combined_docs = get_combined_chunks(chunks_with_metadata, chunks_to_combine=2)
+    # Combine chunks (increase to 4 for speed/efficiency with GPT-4o)
+    combined_docs = get_combined_chunks(chunks_with_metadata, chunks_to_combine=4)
     
      # Configuration for Extraction
     # Can be set in .env. If "OPEN", extraction is unrestricted.
@@ -398,11 +451,11 @@ def ingest_data():
         print("   - Strategy: Open Extraction (No Node Constraints)")
     elif env_nodes:
         allowed_nodes = [n.strip() for n in env_nodes.split(',') if n.strip()]
-        print(f"   - Strategy: Constrained Nodes: {allowed_nodes}")
+        print(f"   - Strategy: Custom Nodes from Env: {allowed_nodes}")
     else:
-        # Default to Open Extraction (Let LLM decide)
-        allowed_nodes = [] 
-        print(f"   - Strategy: Open Extraction (Auto-detect Nodes)")
+        # Default to F1 SCHEMA (Better structured data)
+        allowed_nodes = ["Driver", "Team", "Person", "Car", "Part", "Race", "Circuit", "Location", "Year", "Event", "Organization"]
+        print(f"   - Strategy: Default F1 Schema Nodes: {allowed_nodes}")
 
     if env_rels == "OPEN":
         allowed_rels = [] # Unrestricted
@@ -410,11 +463,11 @@ def ingest_data():
     elif env_rels:
         allowed_rels = [r.strip() for r in env_rels.split(',') if r.strip()]
         # Simple validation could go here later if needed
-        print(f"   - Strategy: Constrained Relationships: {allowed_rels}")
+        print(f"   - Strategy: Custom Relationships from Env: {allowed_rels}")
     else:
-        # Default to Open Extraction (Let LLM decide)
-        allowed_rels = []
-        print(f"   - Strategy: Open Extraction (Auto-detect Relationships)")
+        # Default to F1 SCHEMA
+        allowed_rels = ["DRIVES_FOR", "WORKS_FOR", "LOCATED_AT", "PARTICIPATED_IN", "WON", "HAS_PART", "OCCURRED_IN", "ALSO_KNOWN_AS", "HAS_BUDGET", "EARNED"]
+        print(f"   - Strategy: Default F1 Schema Relationships: {allowed_rels}")
 
     llm_transformer = LLMGraphTransformer(
         llm=llm,
@@ -471,3 +524,7 @@ def ingest_data():
 
 if __name__ == "__main__":
     ingest_data()
+
+#start Data Ingestion 8:49
+#Extracting Graph Knowledge 3:58
+#Ending Ingestion 9:

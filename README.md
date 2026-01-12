@@ -1,6 +1,6 @@
 # 🚀 ระบบ Hybrid RAG ขั้นสูง (Ultimate Hybrid RAG System)
 
-ระบบ Retrieval-Augmented Generation (RAG) ที่ทันสมัยและครบวงจรที่สุด ผสานพลังของ **Knowledge Graph (Neo4j)** และ **Vector Search** เข้าด้วยกัน รองรับการนำเข้าข้อมูลที่หลากหลาย (Multimodal) และมีระบบแชทบอทอัจฉริยะ
+ระบบ Retrieval-Augmented Generation (RAG) ที่ทันสมัยและครบวงจรที่สุด ผสานพลังของ **Knowledge Graph (Neo4j)** และ **Vector Search** เข้าด้วยกัน รองรับการนำเข้าข้อมูลที่หลากหลาย (Multimodal) และมีระบบแชทบอทอัจฉริยะ พร้อม **Web Interface** สำหรับใช้งานผ่านเบราว์เซอร์
 
 ## ✨ คุณสมบัติเด่น (Features)
 
@@ -22,26 +22,37 @@
     *   **ความจำ (Memory):** จำบทสนทนาก่อนหน้าได้ (เช่น ถามต่อว่า "แล้วปีหน้าล่ะ?")
     *   **ภาษาไทย:** รองรับการถาม-ตอบเป็นภาษาไทยอย่างสมบูรณ์
     *   **แสดงรูป:** หากคำตอบอ้างอิงถึงรูปภาพ ระบบจะเปิดรูปภาพนั้นขึ้นมาให้ดูทันที
+    *   **Re-ranking:** ระบบจัดอันดับความเกี่ยวข้องของข้อมูลอัจฉริยะ (รองรับ LLM, Cohere, Cross-Encoder)
+
+*   **🌐 Web Interface (React):**
+    *   **Real-time Chat:** สนทนาแบบเรียลไทม์
+    *   **แสดงแหล่งที่มา:** อ้างอิงไฟล์และหน้าที่ใช้ตอบคำถาม
+    *   **แสดงรูปภาพ:** รูปที่เกี่ยวข้องจะแสดงในหน้าเว็บ
 
 ---
 
 ## 🛠️ การติดตั้ง (Installation)
 
-1.  **Clone โปรเจกต์** หรือเตรียมโฟลเดอร์ให้พร้อม
-2.  **ติดตั้ง Neo4j Desktop** และสร้าง Project ใหม่ (Local Database)
-    *   ใช้ Docker-compose.yml สำหรับการติดตั้ง
-    *   ตั้งค่า volumes ให้ตรงกับโฟลเดอร์ที่ต้องการ
-    เช่น
-    volumes:
-       "C:/Users/******/Neo4j/data:/data"
-       "C:/Users/******/Neo4j/logs:/logs"
-       "C:/Users/******/Neo4j/import:/import"
-       "C:/Users/******/Neo4j/plugins:/plugins"
-3.  **สร้าง Environment และติดตั้ง Library:**
+### 1. ติดตั้ง Neo4j
+**ใช้ Docker-compose.yml สำหรับการติดตั้ง:**
+```yaml
+volumes:
+   "C:/Users/******/Neo4j/data:/data"
+   "C:/Users/******/Neo4j/logs:/logs"
+   "C:/Users/******/Neo4j/import:/import"
+   "C:/Users/******/Neo4j/plugins:/plugins"
+```
 
+### 2. ติดตั้ง Python Dependencies
 ```bash
 # แนะนำให้ใช้ Python 3.10+
 pip install -r requirements.txt
+```
+
+### 3. ติดตั้ง Frontend (Web Interface)
+```bash
+cd frontend
+npm install
 ```
 
 ---
@@ -55,55 +66,139 @@ pip install -r requirements.txt
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=your_password
-ALLOWED_NODES="OPEN"/Node ที่อนุญาติให้ตั้งค่า
-ALLOWED_RELATIONSHIPS="OPEN"/Relationship ที่อนุญาติให้ตั้งค่า
+ALLOWED_NODES="OPEN"
+ALLOWED_RELATIONSHIPS="OPEN"
 
 # OpenAI API
 OpenAi_api=sk-proj-...
 OpenAi_api_embbeding=sk-proj-...
 
-
+# Re-ranker (Optional)
+RERANKER_METHOD=llm  # Options: "llm", "cohere", "cross-encoder"
+# COHERE_API_KEY=your_cohere_key  # If using Cohere
 ```
 
 ---
 
 ## 🚀 การใช้งาน (Usage)
 
-### 1. เตรียมข้อมูล (Prepare Data)
-*   วางไฟล์ PDF, DOCX, TXT หรือรูปภาพที่ต้องการลงในโฟลเดอร์ `data/`
-*   หากต้องการดึงข้อมูลจากเว็บ ให้ใส่ URL ลงในไฟล์ `data/urls.txt` (บรรทัดละ 1 URL)
+### วิธีที่ 1: Command Line (Terminal)
 
-### 2. นำเข้าข้อมูล (Ingestion)
-รันไฟล์ `ingest_graph.py` เพื่อเริ่มกระบวนการ:
-*   สแกนไฟล์ทั้งหมด
-*   ดึงข้อความ/รูปภาพ และอธิบายรูปด้วย AI
-*   สร้าง Vector Embeddings และ Graph
-*   บันทึกรูปลง `data/extracted_images/`
+#### 1. เตรียมข้อมูล
+*   วางไฟล์ PDF, DOCX, TXT หรือรูปภาพลงใน `data/`
+*   ใส่ URL ลงใน `data/urls.txt` (ถ้าต้องการ)
 
+#### 2. นำเข้าข้อมูล
 ```bash
 python ingest_graph.py
 ```
-*(ขั้นตอนนี้อาจใช้เวลาหลายนาที ขึ้นอยู่กับจำนวนไฟล์และความละเอียดของ Semantic Chunking)*
 
-### 3. รันแชทบอท (Run Chatbot)
-เมื่อนำเข้าข้อมูลเสร็จสิ้น ให้รันไฟล์ `run_qa.py` เพื่อเริ่มคุย:
-
+#### 3. รันแชทบอท
 ```bash
 python run_qa.py
 ```
 
-*   **ตัวอย่างการถาม:** "ใครได้คะแนนเยอะที่สุดในปี 2024?"
-*   ถ้าข้อมูลคำตอบอยู่ในรูปภาพ ระบบจะเปิดรูปภาพขึ้นมาให้ดูโดยอัตโนมัติ
+---
+
+### วิธีที่ 2: Web Interface (แนะนำ) 🌐
+
+#### 1. เตรียมข้อมูล (เหมือนวิธีที่ 1)
+```bash
+python ingest_graph.py
+```
+
+#### 2. เปิด Backend API
+```bash
+python api.py
+```
+API จะรันที่ `http://localhost:5000`
+
+#### 3. เปิด Frontend (Terminal ใหม่)
+```bash
+cd frontend
+npm start
+```
+Web Interface จะเปิดที่ `http://localhost:3000`
+
+#### 4. เริ่มใช้งาน!
+- เปิดเบราว์เซอร์ไปที่ `http://localhost:3000`
+- พิมพ์คำถามในช่องแชท
+- ระบบจะแสดง:
+  - คำตอบ
+  - แหล่งที่มา (ไฟล์ + หน้า)
+  - รูปภาพที่เกี่ยวข้อง
 
 ---
 
 ## 📂 โครงสร้างไฟล์ (Project Structure)
 
-*   `ingest_graph.py`: สคริปต์หลักสำหรับนำเข้าข้อมูล (Data Pipeline)
-*   `run_qa.py`: สคริปต์แชทบอท (RAG Chain, Memory, Image Display)
-*   `vision_utils.py`: ฟังก์ชันเสริมสำหรับจัดการรูปภาพและ Vision API
-*   `data/`: โฟลเดอร์เก็บเอกสารต้นฉบับ
-    *   `urls.txt`: ลิงก์เว็บที่ต้องการสแครป
-    *   `extracted_images/`: รูปภาพที่ระบบดึงออกมาจาก PDF (สร้างอัตโนมัติ)
+```
+HybridRAG_testing/
+├── ingest_graph.py          # นำเข้าข้อมูล
+├── run_qa.py                # แชทบอท CLI
+├── api.py                   # Flask API สำหรับ Web
+├── vision_utils.py          # จัดการรูปภาพ
+├── data/
+│   ├── *.pdf, *.docx, *.jpg # ไฟล์ต้นฉบับ
+│   ├── urls.txt             # URL เว็บไซต์
+│   └── extracted_images/    # รูปที่ดึงจาก PDF
+└── frontend/
+    ├── src/
+    │   ├── App.jsx          # React Component
+    │   └── App.css          # Styling
+    └── package.json
+```
 
 ---
+
+## 🔧 คุณสมบัติขั้นสูง (Advanced Features)
+
+### Re-Ranking
+ระบบรองรับ 3 วิธีในการจัดอันดับความเกี่ยวข้อง:
+
+1. **LLM** (Default) - ใช้ GPT-4o
+2. **Cohere** - เร็วและแม่นยำ (แนะนำสำหรับ Production)
+3. **Cross-Encoder** - รันบนเครื่อง ฟรี
+
+ดูรายละเอียดใน `RERANKER_GUIDE.md`
+
+### การปรับแต่ง
+- **จำนวนผลลัพธ์:** แก้ `k=5` ใน `run_qa.py`
+- **คะแนนขั้นต่ำ:** แก้ `min_score=0.7`
+- **จำนวนผลลัพธ์หลัง Re-rank:** แก้ `top_k=3`
+
+---
+
+## 💡 Tips & Tricks
+
+- ถามเป็นภาษาไทยได้เลย ระบบจะตอบเป็นภาษาไทย
+- ถามเป็นภาษาอังกฤษ ระบบจะตอบเป็นภาษาอังกฤษ
+- ถ้ามีรูปภาพที่เกี่ยวข้อง ระบบจะแสดงให้ดูอัตโนมัติ
+- ระบบจำบทสนทนาได้ สามารถถามต่อเนื่องได้
+
+---
+
+## 🆘 Troubleshooting
+
+**ปัญหา: รูปภาพไม่แสดงใน Web**
+- ตรวจสอบว่า `python api.py` รันอยู่
+- เช็คว่ารูปอยู่ใน `data/extracted_images/`
+
+**ปัญหา: ตอบช้า**
+- ลดค่า `k` ใน `run_qa.py`
+- ใช้ Cohere Reranker แทน LLM
+
+**ปัญหา: ตอบไม่ตรงคำถาม**
+- เพิ่มค่า `min_score` เป็น 0.8
+- ตรวจสอบว่าข้อมูลถูกนำเข้าครบแล้ว
+
+---
+
+## 📚 เอกสารเพิ่มเติม
+
+- `RERANKER_GUIDE.md` - คู่มือการตั้งค่า Re-ranker
+- `WEB_README.md` - รายละเอียด Web Interface (เก่า - รวมในไฟล์นี้แล้ว)
+
+---
+
+**พัฒนาด้วย ❤️ โดย Hybrid RAG Team**

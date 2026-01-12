@@ -17,10 +17,15 @@ def encode_image_from_bytes(image_bytes):
     """Encodes in-memory image bytes to base64."""
     return base64.b64encode(image_bytes).decode('utf-8')
 
-def describe_image(base64_image, prompt="Describe this image in detail in English. If it contains text in another language, translate it to English. If it is a chart or table, extract the data."):
+def describe_image(base64_image, prompt="Describe this image in detail in English. If it contains text in another language, translate it to English. If it is a chart or table, extract the data.", save_description_path=None):
     """
     Sends detailed image description request to GPT-4o-Vision.
     Returns the text description.
+    
+    Args:
+        base64_image: Base64 encoded image string
+        prompt: The prompt to send to the Vision API
+        save_description_path: Optional path to save the description as a text file (e.g., "image_description.txt")
     """
     if not API_KEY:
         print("⚠️ No API Key found for Vision.")
@@ -60,6 +65,16 @@ def describe_image(base64_image, prompt="Describe this image in detail in Englis
         response.raise_for_status()
         result = response.json()
         description = result['choices'][0]['message']['content']
+        
+        # Save description to file if path is provided
+        if save_description_path:
+            try:
+                with open(save_description_path, 'w', encoding='utf-8') as f:
+                    f.write(description)
+                print(f"      ✅ Saved description to: {save_description_path}")
+            except Exception as e:
+                print(f"      ⚠️ Could not save description file: {e}")
+        
         return f"\n[IMAGE DESCRIPTION]: {description}\n"
     except Exception as e:
         print(f"⚠️ Vision API Error: {e}")
