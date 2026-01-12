@@ -565,25 +565,18 @@ if __name__ == "__main__":
     chat_history_str = ""
     
     while True:
-        try:
-            q = input("User: ")
-            if q.lower() in ['exit', 'quit', 'q']:
-                print("Bye! 👋")
-                break
-                
-            if not q.strip(): continue # Skip empty
-            
-            result = answer(q, history=chat_history_str)
-            print(f"Bot: {result}\n")
-            print("-" * 50)
-            
-            # Update History (Keep last 3 turns to fit context)
-            chat_history_str += f"User: {q}\nBot: {result}\n"
-            
-        except KeyboardInterrupt:
-            print("\nBye! 👋")
+        q = input("User: ")
+        if q.lower() in ['exit', 'quit', 'q']:
+            print("Bye! 👋")
             break
-        except Exception as e:
-            print(f"❌ Error: {e}")
+                
+        if not q.strip(): continue # Skip empty
+            
+        result = answer(q, history=chat_history_str)
+        print(f"Bot: {result}\n")
+        print("-" * 50)
+            
+        # Update History (Keep last 3 turns to fit context)
+        chat_history_str += f"User: {q}\nBot: {result}\n"
             
 #llm rerank = slow af Cohere vs CROSS-ENCODER need to test
