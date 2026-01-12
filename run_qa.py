@@ -585,4 +585,5 @@ if __name__ == "__main__":
             break
         except Exception as e:
             print(f"❌ Error: {e}")
-#llm rerank = slow af
+            
+#llm rerank = slow af Cohere vs CROSS-ENCODER need to test
