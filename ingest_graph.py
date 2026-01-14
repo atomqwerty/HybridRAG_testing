@@ -149,6 +149,88 @@ def get_combined_chunks(docs, chunks_to_combine=3):
     
     return combined
 
+def load_web_with_images(url):
+    """
+    Scrapes a webpage, downloads meaningful images, and generates a document 
+    combining text and automated image descriptions.
+    """
+    from bs4 import BeautifulSoup
+    import requests
+    from urllib.parse import urljoin
+    
+    print(f"   - Scraping (Multimodal): {url}")
+    
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # 1. Extract Images
+        images = soup.find_all('img')
+        image_descriptions = ""
+        
+        for i, img in enumerate(images):
+            src = img.get('src')
+            if not src: continue
+            
+            # Resolve relative URLs
+            full_url = urljoin(url, src)
+            
+            try:
+                # Download image
+                img_resp = requests.get(full_url, stream=True)
+                if img_resp.status_code != 200: continue
+                
+                # Check size (Skip small icons < 5KB)
+                if len(img_resp.content) < 5000: continue
+                
+                # Save locally
+                img_filename = f"web_{uuid.uuid4().hex[:8]}.jpg"
+                save_dir = Path("data/extracted_images")
+                save_dir.mkdir(parents=True, exist_ok=True)
+                img_path = save_dir / img_filename
+                
+                with open(img_path, "wb") as f:
+                    f.write(img_resp.content)
+                
+                # Analyze with Vision
+                print(f"      📸 Analyzed Web Image: {os.path.basename(full_url)}")
+                b64 = encode_image_from_file(str(img_path))
+                
+                # Save description
+                log_dir = Path("log")
+                log_dir.mkdir(parents=True, exist_ok=True)
+                desc_path = log_dir / (img_filename + '_description.txt')
+                desc = describe_image(b64, save_description_path=str(desc_path))
+                
+                image_descriptions += f"\n[IMAGE PATH: {img_path}]\n[SOURCE URL: {full_url}]\n{desc}\n"
+                
+            except Exception as e:
+                # print(f"      ⚠️ Failed to process image {src}: {e}")
+                continue
+                
+        # 2. Extract Text
+        # Remove scripts and styles
+        for script in soup(["script", "style"]):
+            script.decompose()
+            
+        text = soup.get_text(separator='\n')
+        
+        # Clean up whitespace
+        lines = (line.strip() for line in text.splitlines())
+        clean_text = '\n'.join(line for line in lines if line)
+        
+        # Combine
+        full_content = f"Source URL: {url}\n\n{clean_text}\n\n### DETECTED IMAGES FROM WEBPAGE:\n{image_descriptions}"
+        
+        return [Document(
+            page_content=full_content,
+            metadata={"source": url, "title": soup.title.string if soup.title else url}
+        )]
+        
+    except Exception as e:
+        print(f"      ❌ Web Scraping failed for {url}: {e}")
+        return []
+
 def ingest_data():
     print("🚀 Starting ULTIMATE Hybrid RAG Data Ingestion...")
     
@@ -277,14 +359,64 @@ def ingest_data():
                         docs.append(doc)
                 
             elif ext == '.docx':
-                print(f"   - Loading DOCX: {os.path.basename(file_path)}")
+                print(f"   - Loading DOCX (Multimodal): {os.path.basename(file_path)}")
                 try:
-                    loader = Docx2txtLoader(file_path)
-                    docs.extend(loader.load())
+                    import docx2txt
+                    # Temporary directory for extracting images from this specific doc
+                    img_extract_dir = "data/extracted_images"
+                    os.makedirs(img_extract_dir, exist_ok=True)
+                    
+                    # Extract text and save images
+                    text = docx2txt.process(file_path, img_extract_dir)
+                    
+                    # Now find the images that were just extracted
+                    # docx2txt naming convention isn't easily predictable for mapping exact position,
+                    # so we append all new images found to the end of the text.
+                    # A more robust way requires unzip manipulation, but this works for RAG context.
+                    
+                    # We can iterate over all images in that dir checking creation time? 
+                    # Simpler: docx2txt saves them as 'image1.png', 'image2.jpg', etc. 
+                    # We might clash if we don't manage names. 
+                    # BETTER STRATEGY: Rename them immediately or use a unique temp dir per file.
+                    
+                    # RE-DO: Use a unique sub-folder for this file
+                    unique_id = uuid.uuid4().hex[:8]
+                    temp_img_dir = Path(f"data/extracted_images/docx_{unique_id}")
+                    temp_img_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    text = docx2txt.process(file_path, str(temp_img_dir))
+                    
+                    # Iterate over extracted images
+                    image_descriptions = ""
+                    if temp_img_dir.exists():
+                        for img_file in temp_img_dir.iterdir():
+                            if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                                print(f"      🖼️ Found DOCX Image: {img_file.name}")
+                                
+                                b64 = encode_image_from_file(str(img_file))
+                                
+                                log_dir = Path("log")
+                                log_dir.mkdir(parents=True, exist_ok=True)
+                                desc_path = log_dir / (img_file.name + '_description.txt')
+                                
+                                desc = describe_image(b64, save_description_path=str(desc_path))
+                                image_descriptions += f"\n[IMAGE PATH: {img_file}]\n{desc}\n"
+                    
+                    full_content = text + "\n\n### EXTRACTED IMAGES FROM DOCX:\n" + image_descriptions
+                    
+                    docs.append(Document(
+                        page_content=full_content,
+                        metadata={"source": os.path.basename(file_path)}
+                    ))
+                    
                 except ImportError:
                      print("      ❌ Missing 'docx2txt'. Install it: `pip install docx2txt`")
                      
             elif ext == '.txt':
+                 # Skip the config file for URLs, processed later
+                 if os.path.basename(file_path) == "urls.txt":
+                     continue
+                     
                  print(f"   - Loading TXT: {os.path.basename(file_path)}")
                  loader = TextLoader(file_path)
                  docs.extend(loader.load())
@@ -333,17 +465,13 @@ def ingest_data():
             urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
         
         if urls:
-            try:
-                print(f"   - Scaping {len(urls)} URLs: {urls}")
-                loader = WebBaseLoader(urls)
-                web_docs = loader.load()
-                # Determine "Title" from metadata if possible, else use URL
-                for d in web_docs:
-                    d.metadata["source"] = d.metadata.get("source", d.metadata.get("url", "webpage"))
-                docs.extend(web_docs)
-                print(f"   ✅ Loaded {len(web_docs)} web pages.")
-            except Exception as e:
-                print(f"   ⚠️ Web loading failed: {e}")
+            print(f"   - Processing {len(urls)} URLs...")
+            for url in urls:
+                try:
+                    web_docs = load_web_with_images(url)
+                    docs.extend(web_docs)
+                except Exception as e:
+                     print(f"      ⚠️ Failed to load {url}: {e}")
         else:
             print("   (urls.txt is empty)")
             
