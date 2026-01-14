@@ -127,18 +127,40 @@ def serve_image(filename):
 
 import subprocess
 import threading
+import atexit
+import sys
+
+# Global variable to store the frontend process
+frontend_process = None
+
+def cleanup():
+    """Kills the frontend process on shutdown"""
+    global frontend_process
+    if frontend_process:
+        print("🛑 Stopping React Frontend...")
+        # On Windows, we need to be aggressive to kill the process tree
+        subprocess.call(['taskkill', '/F', '/T', '/PID', str(frontend_process.pid)])
 
 def start_frontend():
     """Starts the React frontend in a separate thread"""
+    global frontend_process
     print("🚀 Starting React Frontend...")
     frontend_dir = os.path.join(os.path.dirname(__file__), 'frontend')
-    # Use shell=True for Windows compatibility with npm
-    subprocess.Popen('npm start', cwd=frontend_dir, shell=True)
+    
+    # Use shell=True for Windows compatibility
+    frontend_process = subprocess.Popen('npm start', cwd=frontend_dir, shell=True)
 
 if __name__ == '__main__':
+    # Register cleanup to run when the script exits (Ctrl+C)
+    atexit.register(cleanup)
+    
     # Start frontend in background
     threading.Thread(target=start_frontend, daemon=True).start()
     
     print("🚀 Starting RAG API Server...")
     print("📡 API available at: http://localhost:8000")
-    app.run(debug=True, port=8000)
+    try:
+        app.run(debug=True, port=8000, use_reloader=False) # use_reloader=False prevents double process spawning
+    except KeyboardInterrupt:
+        pass # Handle manual stop cleanly
+    
