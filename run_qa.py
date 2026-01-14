@@ -471,7 +471,7 @@ Standalone question:"""
                 p = p.strip()
                 if os.path.exists(p):
                     print(f"🖼️ Opening relevant image: {p}")
-                    Image.open(p).show()
+                    # Image.open(p).show()
             except Exception as e:
                 print(f"⚠️ Could not display image {p}: {e}")
 

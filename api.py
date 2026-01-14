@@ -109,6 +109,11 @@ def health():
     """Health check endpoint"""
     return jsonify({"status": "ok"})
 
+@app.route('/')
+def index():
+    """Root endpoint to verify server is running"""
+    return "<h1>✅ Hybrid RAG API is Running!</h1><p>Use the frontend at <a href='http://localhost:3000'>http://localhost:3000</a> to chat.</p>"
+
 @app.route('/images/<path:filename>')
 def serve_image(filename):
     """Serve images from data directory"""
@@ -120,11 +125,20 @@ def serve_image(filename):
     data_dir = os.path.join(os.path.dirname(__file__), 'data')
     return send_from_directory(data_dir, filename)
 
-if __name__ == '__main__':
-    print("🚀 Starting RAG API Server...")
-    print("📡 API available at: http://localhost:5000")
-    app.run(debug=True, port=5000)
+import subprocess
+import threading
 
-#cd C:\Users\Dashboard\Downloads\HybridRAG_testing
-#conda activate neo4j_rag
-#python api.py
+def start_frontend():
+    """Starts the React frontend in a separate thread"""
+    print("🚀 Starting React Frontend...")
+    frontend_dir = os.path.join(os.path.dirname(__file__), 'frontend')
+    # Use shell=True for Windows compatibility with npm
+    subprocess.Popen('npm start', cwd=frontend_dir, shell=True)
+
+if __name__ == '__main__':
+    # Start frontend in background
+    threading.Thread(target=start_frontend, daemon=True).start()
+    
+    print("🚀 Starting RAG API Server...")
+    print("📡 API available at: http://localhost:8000")
+    app.run(debug=True, port=8000)

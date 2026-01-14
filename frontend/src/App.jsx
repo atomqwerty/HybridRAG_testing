@@ -98,7 +98,7 @@ function App() {
         setLoading(true);
 
         try {
-            const response = await fetch('http://localhost:5000/api/chat', {
+            const response = await fetch('http://localhost:8000/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -134,7 +134,7 @@ function App() {
 
     const clearChat = async () => {
         try {
-            await fetch('http://localhost:5000/api/clear', {
+            await fetch('http://localhost:8000/api/clear', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ session_id: sessionId })
@@ -186,9 +186,9 @@ function App() {
                                         {msg.images.map((img, i) => (
                                             <div key={i} className="image-item">
                                                 <img
-                                                    src={`http://localhost:5000/images/${img}`}
+                                                    src={`http://localhost:8000/images/${img}`}
                                                     alt={`Reference ${i + 1}`}
-                                                    onClick={() => openLightbox(`http://localhost:5000/images/${img}`)}
+                                                    onClick={() => openLightbox(`http://localhost:8000/images/${img}`)}
                                                 />
                                             </div>
                                         ))}
