@@ -42,8 +42,6 @@ frontend/.env
 .DS_Store
 Thumbs.db
 
-check_graph_stats.py
-check_image.py
 data/extracted_images
 Test
 __pycache__
