@@ -177,8 +177,8 @@ def hybrid_context(graph, embeddings, question):
         print(f"\n🔑 DEBUG: Keyword Search Found {len(keyword_ctx)} results")
     
     # B. Vector Search (Good for concepts)
-    # Reduced k=15 for speed (was 25). 
-    vector_ctx = vector_retrieve(graph, embeddings, question, k=15, min_score=0.25)
+    # Reduced k=15 for speed. Increased min_score=0.50 to reduce unrelated images.
+    vector_ctx = vector_retrieve(graph, embeddings, question, k=15, min_score=0.50)
     
     # TRACE Retrieval
     if vector_ctx:
@@ -493,50 +493,57 @@ Standalone question:"""
     display_sources_from_context(context)
     
     # --- Step 3: Generate Answer ---
-    template = """You are a helpful and proactive AI assistant for a Formula 1 Knowledge Base.
+    template = """You are an intelligent AI assistant for a Formula 1 Knowledge Base.
+    
+<instruction>
+Please answer the user's question based ONLY on the provided context.
 
-CRITICAL PROTOCOL FOR MISSING/UNCLEAR INFO:
-If the Context is empty or does not contain the answer, YOU MUST NOT SAY "I don't know".
-Instead, you MUST:
-1. **Ask a specific clarifying question** (e.g., "Are you asking about the 2024 season or 2023?" or "Do you mean the Driver's standings?").
-2. **Offer available alternatives** if you see related data (e.g., "I don't have 2025 data, but I can show you 2024.").
-3. **Guess the user's intent** responsibly (e.g., "If you are asking about X, then the answer is... But if you mean Y, then...").
+STRATEGY (Chain of Thought):
+1. **Analyze** the user's question to understand the core intent (e.g., specific fact, comparison, or summary).
+2. **Scan** the <context> specifically for this information.
+3. **Verify** that the data in the context directly supports your answer. If data is conflicting, cite the most recent source.
+4. **Draft** your response in the requested language.
+
+CRITICAL RULES:
+- **Language:** Answer in the SAME language as the <question> (English -> English, Thai -> Thai).
+- **No Hallucination:** If the answer is not in <context>, say you don't know. Do NOT make up facts.
+- **Clarification:** If the <context> represents a partial match (e.g., 2023 data instead of 2024), explicitly ask the user if they want that info.
 
 SOURCE ATTRIBUTION:
-- When presenting specific facts (especially technical terms like "Dive Plane" or financial figures), explicitly state the source if possible.
-- Example: "According to the 2022 Car Changes infographic..." or "The financial report shows..."
-
-LANGUAGE RULE (MANDATORY):
-- If the user asks in ENGLISH, answer in ENGLISH.
-- If the user asks in THAI, answer in THAI.
-- If the user asks in SPANISH, answer in SPANISH.
+- When presenting specific stats (e.g., "Max won 15 races"), cite the source if available in the text.
+- Tech Specs: Use bolding for technical terms (e.g., **Dive Plane**) found in image descriptions.
 
 IMAGES:
-If the context contains [IMAGE PATH: ...], mention that images have been opened.
+- If <context> mentions [IMAGE PATH: ...], tell the user "I have opened relevant images for you."
 
-SPECIAL INSTRUCTION FOR TABLES:
-If the context contains tabular data (rows of text/numbers):
-1. Identify potential column headers (e.g., 'Points', 'Total', 'Revenue', 'Score').
-2. Align the values in each row to these headers.
-3. Be careful of footnote markers (e.g., a '2' or '[1]' appearing right after a number). '581 2' likely means '581' with footnote '2', not '5812'.
-4. Extract the value that mathematically or semantically matches the question.
-5. **FORMAT AS TABLE**: When presenting tabular data, format it as a markdown table for better readability:
-   ```
-   | Column 1 | Column 2 | 
-   |----------|----------|
-   | Value 1  | Value 2  | 
-   ```
-6. **Include the full table** if the user asks about table contents, so they can see all the data for reference.
+TABLE LOGIC (Chain of Table):
+- If your answer is derived from a table, **YOU MUST** display relevant rows as a Markdown Table.
+- **DO NOT** just summarize the result in a sentence (e.g., "Max was first").
+- **DO** show:
+  | Driver | Position |
+  |--------|----------|
+  | Max    | 1        |
+</instruction>
 
-DATA CONTEXT:
-{context}
-
-HISTORY:
+<history>
 {history}
+</history>
 
-QUESTION:
+<context>
+{context}
+</context>
+
+<question>
 {question}
-ANSWER:"""
+</question>
+
+<response_guidelines>
+- Take a deep breath and think step by step.
+- Be concise but complete.
+- Explain technical terms simply (ELI5 style).
+- **FORMATTING:** Use PLAIN TEXT for narrative (no bolding/headers). **EXCEPTION:** You MUST use Markdown Tables for tabular data.
+</response_guidelines>
+"""
 
     prompt = ChatPromptTemplate.from_template(template)
     
@@ -556,7 +563,11 @@ ANSWER:"""
     # For debugging:
     # print(f"🤖 Context Used:\n{context}\n")
     
-    return response
+    # Return structured data including context to avoid double-fetching
+    return {
+        "result": response,
+        "context": context
+    }
 
 # 5. Run it (Interactive Mode)
 if __name__ == "__main__":
@@ -572,11 +583,11 @@ if __name__ == "__main__":
                 
         if not q.strip(): continue # Skip empty
             
-        result = answer(q, history=chat_history_str)
-        print(f"Bot: {result}\n")
+        output = answer(q, history=chat_history_str)
+        print(f"Bot: {output['result']}\n")
         print("-" * 50)
             
         # Update History (Keep last 3 turns to fit context)
-        chat_history_str += f"User: {q}\nBot: {result}\n"
+        chat_history_str += f"User: {q}\nBot: {output['result']}\n"
             
 #llm rerank = slow af Cohere vs CROSS-ENCODER need to test

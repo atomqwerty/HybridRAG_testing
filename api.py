@@ -71,14 +71,16 @@ def chat():
         
         history = chat_sessions[session_id]
         
-        # Get answer
-        bot_response = answer(user_message, history=history)
+        # Get answer (returns dict with result and context)
+        output = answer(user_message, history=history)
+        bot_response = output['result']
+        context = output['context']
         
         # Update history
         chat_sessions[session_id] += f"User: {user_message}\nBot: {bot_response}\n"
         
-        # Extract sources and images from the context
-        context = hybrid_context(graph, embeddings, user_message)
+        # Extract sources and images from the context (already retrieved!)
+        # context = hybrid_context(graph, embeddings, user_message) <-- REMOVED DOUBLE CALL
         sources = re.findall(r"\[Source: (.*?), Page: (.*?)\]", context)
         image_paths = re.findall(r"\[IMAGE PATH: (.*?)\]", context)
         
@@ -122,3 +124,7 @@ if __name__ == '__main__':
     print("🚀 Starting RAG API Server...")
     print("📡 API available at: http://localhost:5000")
     app.run(debug=True, port=5000)
+
+#cd C:\Users\Dashboard\Downloads\HybridRAG_testing
+#conda activate neo4j_rag
+#python api.py
