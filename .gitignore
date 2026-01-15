@@ -45,3 +45,4 @@ Thumbs.db
 data/extracted_images
 Test
 __pycache__
+/data
