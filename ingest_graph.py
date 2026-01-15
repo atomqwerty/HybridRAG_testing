@@ -3,6 +3,9 @@ import glob
 import time
 import hashlib
 import uuid
+import hashlib
+import uuid
+import concurrent.futures
 from pathlib import Path
 from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
@@ -149,68 +152,199 @@ def get_combined_chunks(docs, chunks_to_combine=3):
     
     return combined
 
-def load_web_with_images(url):
+def get_internal_links(base_url, max_links=15):
     """
-    Scrapes a webpage, downloads meaningful images, and generates a document 
-    combining text and automated image descriptions.
+    Finds internal links using Selenium to handle dynamic JS menus.
     """
-    from bs4 import BeautifulSoup
-    import requests
-    from urllib.parse import urljoin
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    from urllib.parse import urljoin, urlparse
+    import time
+
+    print(f"   🕷️ Crawling (RPA) sub-pages for: {base_url}")
+    links_to_visit = set([base_url])
     
-    print(f"   - Scraping (Multimodal): {url}")
+    # Setup Headless Chrome
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--window-size=1920,1080")
     
     try:
-        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        soup = BeautifulSoup(response.content, 'html.parser')
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
         
-        # 1. Extract Images
+        try:
+            driver.get(base_url)
+            time.sleep(3) # Wait for JS to render
+            
+            # Extract links from rendered DOM
+            domain = urlparse(base_url).netloc
+            elements = driver.find_elements("tag name", "a")
+            
+            for elem in elements:
+                try:
+                    href = elem.get_attribute("href")
+                    if not href: continue
+                    
+                    full_url = urljoin(base_url, href)
+                    parsed_url = urlparse(full_url)
+                    
+                    possible_noise = ['about', 'contact', 'legal', 'privacy', 'terms', 'login', 'signup', 'cart', 'facebook', 'twitter', 'linkedin']
+                    if any(x in parsed_url.path.lower() for x in possible_noise):
+                        continue
+
+                    # Strict filtering
+                    if parsed_url.netloc == domain and parsed_url.scheme in ['http', 'https']:
+                        if not any(ext in parsed_url.path.lower() for ext in ['.jpg', '.png', '.pdf', '.zip']):
+                             links_to_visit.add(full_url)
+                    
+                    if len(links_to_visit) >= max_links:
+                        break
+                except:
+                    continue
+                    
+        finally:
+            driver.quit()
+                
+    except Exception as e:
+        print(f"      ⚠️ Crawling failed: {e}")
+        
+    return list(links_to_visit)
+
+def load_web_with_images(url):
+    """
+    Uses Selenium (RPA) to render the page, scroll for lazy loading,
+    and extract high-fidelity text and images.
+    """
+    from bs4 import BeautifulSoup
+    import requests # Keep requests for image downloading only
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    from urllib.parse import urljoin
+    import time
+    
+    print(f"   - Scraping (RPA/Selenium): {url}")
+    
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--window-size=1920,1080")
+    
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        
+        try:
+            driver.get(url)
+            
+            # --- RPA Action: Scroll to Bottom to trigger Lazy Loading ---
+            print("      ↓ Auto-scrolling to trigger lazy content...")
+            last_height = driver.execute_script("return document.body.scrollHeight")
+            while True:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2) # Wait for page to load
+                new_height = driver.execute_script("return document.body.scrollHeight")
+                if new_height == last_height:
+                    break
+                last_height = new_height
+            # -------------------------------------------------------------
+            
+            # Get fully rendered HTML
+            soup = BeautifulSoup(driver.page_source, 'html.parser')
+            
+        finally:
+            driver.quit()
+        
+        # 1. Extract Images (from the rendered Soup)
         images = soup.find_all('img')
         image_descriptions = ""
         
-        for i, img in enumerate(images):
-            src = img.get('src')
+        # --- SMART SELECTION STRATEGY ---
+        # 1. Collect potential candidates
+        candidates = []
+        for img in images:
+            src = img.get('src') or img.get('data-src')
             if not src: continue
+            if src.startswith("data:image"): continue
             
-            # Resolve relative URLs
             full_url = urljoin(url, src)
             
+            # Filter noise keywords in URL
+            if any(x in full_url.lower() for x in ['logo', 'icon', 'button', 'social', 'footer']): 
+                continue
+                
+            candidates.append(full_url)
+
+        # 2. Download and Filter by Size (Get the "Meatier" content)
+        valid_images = [] # List of (size_in_bytes, local_path, source_url)
+        MAX_CANDIDATES_CHECK = 20 # Check up to 20 images to find the best ones
+        
+        print(f"      🔎 Scanning {len(candidates)} images to find the most important ones...")
+        
+        for full_url in list(set(candidates))[:MAX_CANDIDATES_CHECK]:
             try:
-                # Download image
-                img_resp = requests.get(full_url, stream=True)
+                img_resp = requests.get(full_url, stream=True, timeout=3)
                 if img_resp.status_code != 200: continue
                 
-                # Check size (Skip small icons < 5KB)
-                if len(img_resp.content) < 5000: continue
+                size = len(img_resp.content)
+                if size < 8000: continue # Skip small images (< 8KB) - likely spacers/icons
                 
-                # Save locally
-                img_filename = f"web_{uuid.uuid4().hex[:8]}.jpg"
+                # Save locally temporarily
+                suffix = Path(full_url).suffix
+                if not suffix or suffix.lower() not in ['.jpg', '.png', '.jpeg', '.webp']:
+                    suffix = '.jpg'
+                    
+                img_filename = f"web_{uuid.uuid4().hex[:8]}{suffix}"
                 save_dir = Path("data/extracted_images")
                 save_dir.mkdir(parents=True, exist_ok=True)
                 img_path = save_dir / img_filename
                 
                 with open(img_path, "wb") as f:
                     f.write(img_resp.content)
+                    
+                # Skip SVGs
+                if img_path.suffix.lower() == '.svg': 
+                    continue
+                    
+                valid_images.append((size, img_path, full_url))
                 
-                # Analyze with Vision
-                print(f"      📸 Analyzed Web Image: {os.path.basename(full_url)}")
+            except:
+                continue
+        
+        # 3. Sort by Size (Descending) -> Largest images differ likely to be Main Content/Diagrams
+        valid_images.sort(key=lambda x: x[0], reverse=True)
+        
+        # 4. Select Top 5
+        top_images = valid_images[:5]
+        print(f"      🏆 Selected top {len(top_images)} largest images for analysis.")
+
+        # 5. Analyze with Vision
+        for _, img_path, full_url in top_images:
+            try:
+                print(f"      📸 Analyzed Web Image: {os.path.basename(full_url)[:30]}...")
                 b64 = encode_image_from_file(str(img_path))
                 
                 # Save description
                 log_dir = Path("log")
                 log_dir.mkdir(parents=True, exist_ok=True)
-                desc_path = log_dir / (img_filename + '_description.txt')
-                desc = describe_image(b64, save_description_path=str(desc_path))
+                desc_path = log_dir / (img_path.stem + '_description.txt')
                 
+                desc = describe_image(b64, save_description_path=str(desc_path))
                 image_descriptions += f"\n[IMAGE PATH: {img_path}]\n[SOURCE URL: {full_url}]\n{desc}\n"
                 
             except Exception as e:
-                # print(f"      ⚠️ Failed to process image {src}: {e}")
-                continue
+                print(f"      ⚠️ Vision analysis failed: {e}")
                 
         # 2. Extract Text
         # Remove scripts and styles
-        for script in soup(["script", "style"]):
+        for script in soup(["script", "style", "noscript"]):
             script.decompose()
             
         text = soup.get_text(separator='\n')
@@ -222,16 +356,35 @@ def load_web_with_images(url):
         # Combine
         full_content = f"Source URL: {url}\n\n{clean_text}\n\n### DETECTED IMAGES FROM WEBPAGE:\n{image_descriptions}"
         
+        # FINAL CLEAN: Remove Markdown Bolding (User Request)
+        full_content = full_content.replace("**", "").replace("__", "")
+        
+        # --- Log Scraped Content ---
+        try:
+            log_dir = Path("log")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            # Create simple filename
+            sanitized_name = url.replace("https://", "").replace("http://", "").replace("/", "_").replace(":", "")[:50]
+            log_file = log_dir / f"web_scraped_{sanitized_name}_{uuid.uuid4().hex[:6]}.txt"
+            
+            with open(log_file, "w", encoding="utf-8") as f:
+                f.write(full_content)
+            print(f"      📝 Scraped content saved to: {log_file}")
+        except Exception as e:
+            print(f"      ⚠️ Failed to save web log: {e}")
+        # ---------------------------
+        
         return [Document(
             page_content=full_content,
             metadata={"source": url, "title": soup.title.string if soup.title else url}
         )]
         
     except Exception as e:
-        print(f"      ❌ Web Scraping failed for {url}: {e}")
+        print(f"      ❌ Web Scraping (Selenium) failed for {url}: {e}")
         return []
 
 def ingest_data():
+    start_time = time.time()
     print("🚀 Starting ULTIMATE Hybrid RAG Data Ingestion...")
     
     # --- 1. Connect ---
@@ -465,8 +618,18 @@ def ingest_data():
             urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
         
         if urls:
-            print(f"   - Processing {len(urls)} URLs...")
-            for url in urls:
+            print(f"   - Found {len(urls)} root URLs.")
+            all_urls_to_process = set()
+            
+            # 1. Expand URLs (Crawl 1 level deep)
+            for root_url in urls:
+                sub_links = get_internal_links(root_url, max_links=10) # Crawl sub-pages
+                all_urls_to_process.update(sub_links)
+            
+            print(f"   - Processing {len(all_urls_to_process)} total pages (Root + Sub-pages)...")
+            
+            # 2. Scrape Each
+            for url in all_urls_to_process:
                 try:
                     web_docs = load_web_with_images(url)
                     docs.extend(web_docs)
@@ -604,55 +767,64 @@ def ingest_data():
     )
     
     # Process in Smaller Batches
+    # Process in Smaller Batches
     BATCH_SIZE = 5
     total_batches = (len(combined_docs) + BATCH_SIZE - 1) // BATCH_SIZE
 
-    for batch_idx in range(total_batches):
+    def process_batch(batch_idx):
         start = batch_idx * BATCH_SIZE
         end = start + BATCH_SIZE
         batch_combined = combined_docs[start:end]
         
-        print(f"   - Processing Batch {batch_idx + 1}/{total_batches} ({len(batch_combined)} combined docs)...")
-        
+        print(f"   - Processing Batch {batch_idx + 1}/{total_batches} ({len(batch_combined)} docs)...")
         try:
-            print("      > Sending request to LLM (this may take 10-20s)...")
-            graph_docs = llm_transformer.convert_to_graph_documents(batch_combined)
-            print("      > Received response from LLM.")
-            
-            if not graph_docs: continue
-            
-            graph.add_graph_documents(graph_docs)
-            
-            # Link Entities to ALL Source Chunks
-            for g_doc in graph_docs:
-                # Get the list of chunk IDs this graph doc was derived from
-                chunk_ids = g_doc.source.metadata.get('combined_chunk_ids', [])
-                
-                for chunk_id in chunk_ids:
-                    for node in g_doc.nodes:
-                        graph.query("""
-                            MATCH (c:Chunk {id: $chunk_id})
-                            MERGE (e:Entity {id: $node_id})
-                            ON CREATE SET e.type = $node_type
-                            MERGE (c)-[:HAS_ENTITY]->(e)
-                        """, {
-                            'chunk_id': chunk_id,
-                            'node_id': node.id,
-                            'node_type': node.type
-                        })
-                    
+            return llm_transformer.convert_to_graph_documents(batch_combined)
         except Exception as e:
-            print(f"   ⚠️ Error processing batch {batch_idx + 1}: {e}")
+            print(f"      ⚠️ Batch {batch_idx + 1} failed: {e}")
+            return []
+
+    print(f"   🚀 Running Extraction in Parallel (4 Workers)...")
+    
+    all_graph_docs = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        results = executor.map(process_batch, range(total_batches))
+        for res in results:
+            if res:
+                all_graph_docs.extend(res)
+
+    print(f"   ✅ Extraction Complete. Adding {len(all_graph_docs)} graph documents to Neo4j...")
+    
+    if all_graph_docs:
+        graph.add_graph_documents(all_graph_docs)
+        
+        # Link Entities to ALL Source Chunks
+        for g_doc in all_graph_docs:
+            chunk_ids = g_doc.source.metadata.get('combined_chunk_ids', [])
+            for chunk_id in chunk_ids:
+                for node in g_doc.nodes:
+                    graph.query("""
+                        MATCH (c:Chunk {id: $chunk_id})
+                        MERGE (e:Entity {id: $node_id})
+                        ON CREATE SET e.type = $node_type
+                        MERGE (c)-[:HAS_ENTITY]->(e)
+                    """, {
+                        'chunk_id': chunk_id,
+                        'node_id': node.id,
+                        'node_type': node.type
+                    })
 
     # --- 6. Post-Processing ---
     clean_graph_schema(graph)
     enrich_communities(graph)
     
-    print("\n🎉 Ultimate Ingestion Complete!")
+    end_time = time.time()
+    duration = end_time - start_time
+    minutes = int(duration // 60)
+    seconds = int(duration % 60)
+    
+    print(f"\n🎉 Ultimate Ingestion Complete!")
+    print(f"⏱️ Total Time Taken: {minutes}m {seconds}s")
 
 if __name__ == "__main__":
     ingest_data()
-
-#start Data Ingestion 8:49
-#Extracting Graph Knowledge 3:58
-#Ending Ingestion 9:

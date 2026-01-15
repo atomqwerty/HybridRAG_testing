@@ -1,6 +1,7 @@
 import base64
 import os
 import requests
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -60,22 +61,45 @@ def describe_image(base64_image, prompt="Describe this image in detail in Englis
         "temperature": 0
     }
 
-    try:
-        response = requests.post(BASE_URL, headers=headers, json=payload)
-        response.raise_for_status()
-        result = response.json()
-        description = result['choices'][0]['message']['content']
-        
-        # Save description to file if path is provided
-        if save_description_path:
-            try:
-                with open(save_description_path, 'w', encoding='utf-8') as f:
-                    f.write(description)
-                print(f"      ✅ Saved description to: {save_description_path}")
-            except Exception as e:
-                print(f"      ⚠️ Could not save description file: {e}")
-        
-        return f"\n[IMAGE DESCRIPTION]: {description}\n"
-    except Exception as e:
-        print(f"⚠️ Vision API Error: {e}")
-        return ""
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(BASE_URL, headers=headers, json=payload, timeout=20)
+            
+            if response.status_code == 200:
+                result = response.json()
+                description = result['choices'][0]['message']['content']
+                
+                if save_description_path:
+                    try:
+                        with open(save_description_path, "w", encoding="utf-8") as f:
+                            f.write(description)
+                        print(f"      ✅ Saved description to: {save_description_path}")
+                    except Exception as e:
+                        print(f"      ⚠️ Could not save description file: {e}")
+                return f"\n[IMAGE DESCRIPTION]: {description}\n"
+                
+            elif response.status_code == 429:
+                print(f"      ⚠️ Rate limit hit. Retrying in {2**attempt}s...")
+                time.sleep(2**attempt)
+            else:
+                # If it's a 400 error, it's likely a bad image format or too large
+                if response.status_code == 400 and attempt == 0:
+                     print(f"      ⚠️ Vision API 400 Error. Skipping this image.")
+                     return "[Image analysis skipped due to API rejection]"
+                
+                print(f"      ⚠️ Vision API Error: {response.status_code} {response.reason}")
+                return ""
+                
+        except requests.exceptions.Timeout:
+            print(f"      ⚠️ Request timed out. Retrying (attempt {attempt + 1}/{max_retries})...")
+            time.sleep(2**attempt)
+        except requests.exceptions.RequestException as e:
+            print(f"      ⚠️ Request failed: {e}. Retrying (attempt {attempt + 1}/{max_retries})...")
+            time.sleep(1)
+        except Exception as e:
+            print(f"      ⚠️ An unexpected error occurred: {e}")
+            return ""
+
+    return ""

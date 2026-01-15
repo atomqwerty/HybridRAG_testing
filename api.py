@@ -80,14 +80,69 @@ def chat():
         chat_sessions[session_id] += f"User: {user_message}\nBot: {bot_response}\n"
         
         # Extract sources and images from the context (already retrieved!)
-        # context = hybrid_context(graph, embeddings, user_message) <-- REMOVED DOUBLE CALL
-        sources = re.findall(r"\[Source: (.*?), Page: (.*?)\]", context)
-        image_paths = re.findall(r"\[IMAGE PATH: (.*?)\]", context)
-        
+        # Extract sources and images from the context (already retrieved!)
+        # Extract Sources & Images
+        try:
+            sources_list = re.findall(r"\[Source: (.*?), Page: (.*?)\]", context)
+            
+            # Extract and Limit Images (Max 2 Unique)
+            raw_image_paths = re.findall(r"\[IMAGE PATH: (.*?)\]", context)
+            unique_images = []
+            seen_imgs = set()
+            
+            for img_p in raw_image_paths:
+                try:
+                    img_p = img_p.strip()
+                    if img_p not in seen_imgs:
+                        seen_imgs.add(img_p)
+                        
+                        # Fix path separators
+                        norm_path = img_p.replace('\\', '/')
+                        
+                        # We want the path relative to 'data/'
+                        # If path is 'data/extracted_images/foo.jpg' -> 'extracted_images/foo.jpg'
+                        if 'data/' in norm_path:
+                            # Split by 'data/' and take the last part
+                            rel_path = norm_path.split('data/')[-1]
+                        else:
+                            # Fallback: just use the filename if path format is unexpected
+                            rel_path = os.path.basename(norm_path)
+                            # If it's an extracted image, prepending the folder might be guessing, 
+                            # but usually safe if we know where they go.
+                            if 'web_' in rel_path or 'extracted_' in rel_path:
+                                rel_path = f"extracted_images/{rel_path}"
+                                
+                        unique_images.append(rel_path)
+                except Exception as img_err:
+                    print(f"⚠️ Error processing image path {img_p}: {img_err}")
+                    continue
+            
+            # Limit images to 2
+            final_images = unique_images[:2]
+            
+            # Extract Valid Sources (Max 3, No Images)
+            valid_sources = []
+            for src, pg in sources_list:
+                if len(valid_sources) >= 3: break
+                
+                # Clean up source string
+                src_clean = src.strip()
+                
+                # Skip if source looks like an image file
+                if any(src_clean.lower().endswith(ext) for ext in ['.jpg', '.png', '.jpeg', '.webp']):
+                    continue
+                    
+                valid_sources.append({"file": os.path.basename(src_clean), "page": pg})
+                
+        except Exception as parse_err:
+            print(f"⚠️ Error parsing sources/images: {parse_err}")
+            final_images = []
+            valid_sources = []
+
         return jsonify({
             "response": bot_response,
-            "sources": [{"file": src, "page": pg} for src, pg in sources],
-            "images": image_paths
+            "sources": valid_sources,
+            "images": final_images
         })
         
     except Exception as e:

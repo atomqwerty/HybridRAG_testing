@@ -466,12 +466,22 @@ Standalone question:"""
     # --- Step 2.5: Display Cited Images & Sources ---
     def display_images_from_context(text):
         paths = re.findall(r"\[IMAGE PATH: (.*?)\]", text)
+        seen_paths = set()
+        count = 0
+        MAX_IMAGES = 2 # Limit to avoid overwhelming user
+        
         for p in paths:
             try:
                 p = p.strip()
+                if p in seen_paths: continue
+                seen_paths.add(p)
+                
+                if count >= MAX_IMAGES: break # Stop after max
+                
                 if os.path.exists(p):
                     print(f"🖼️ Opening relevant image: {p}")
                     # Image.open(p).show()
+                    count += 1
             except Exception as e:
                 print(f"⚠️ Could not display image {p}: {e}")
 
