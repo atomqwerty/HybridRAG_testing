@@ -165,7 +165,7 @@ def keyword_retrieve(graph, question, k=5):
         print(f"⚠️ Keyword search failed: {e}")
         return []
 
-def hybrid_context(graph, embeddings, question):
+def hybrid_context(graph, embeddings, question, llm_model):
     """Combines Graph, Vector, and Keyword context."""
     
     # 0. Ensure Indexes
@@ -173,7 +173,7 @@ def hybrid_context(graph, embeddings, question):
     create_chunk_fulltext_index(graph) # For Chunks (Hybrid)
     
     # 1. GRAPH SEARCH (Knowledge Graph)
-    graph_ctx = retrieve_graph_context(graph, llm, question)
+    graph_ctx = retrieve_graph_context(graph, llm_model, question)
     if graph_ctx:
         print(f"\n🕸️ DEBUG: Graph Search Found:\n{graph_ctx[:300]}...")
     else:
@@ -230,21 +230,41 @@ def hybrid_context(graph, embeddings, question):
         image_file_results = [r for r in vector_ctx if is_img_file(r)]
         
         # Rerank everything
-        reranked = rerank_results(question, vector_ctx, top_k=5, method=RERANKER_METHOD)
+        reranked = rerank_results(question, vector_ctx, top_k=5, method=RERANKER_METHOD, llm_model=llm_model)
         
         # 🔍 TRACE 2: After Rerank
         reranked_img_files = [r.get('source', '') for r in reranked if is_img_file(r)]
         print(f"   📸 Image Files surviving re-rank: {reranked_img_files}")
         
-        # FORCE INCLUDE: If no ACTUAL IMAGE FILES in top 5, but we had them in retrieval, add the best matching one
+        # FORCE INCLUDE STRATEGY (Improved)
         has_img_file_in_top = len(reranked_img_files) > 0
         
         if not has_img_file_in_top and image_file_results:
-            print("   👉 No standalone images in top results, forcing inclusion of best image file.")
-            # Add the highest scored image file from original retrieval
-            best_image = image_file_results[0]
-            reranked.append(best_image)
-            print(f"   📸 Added back: {best_image.get('source', 'unknown')}")
+             # Find the "Top Text Source" to try and match context
+             top_text_source = None
+             for r in reranked:
+                 if not is_img_file(r):
+                     top_text_source = r.get('source')
+                     break
+             
+             # Filter images: Must be high score OR match the text source
+             valid_images = []
+             for img in image_file_results:
+                 # Strict Score Threshold for unrelated images
+                 is_related_source = (top_text_source and img.get('source') == top_text_source)
+                 is_high_score = img.get('score', 0) > 0.65
+                 
+                 if is_related_source or is_high_score:
+                     valid_images.append(img)
+            
+             if valid_images:
+                print("   👉 Checking for relevant images to force-include...")
+                # Pick the best valid one
+                best_image = valid_images[0]
+                reranked.append(best_image)
+                print(f"   📸 Added back relevant image: {best_image.get('source', 'unknown')}")
+             else:
+                 print("   🚫 No high-confidence images found. Skipping force-include.")
             
         vector_ctx = reranked
         print(f"   ✅ Final context count: {len(vector_ctx)}")
@@ -274,7 +294,7 @@ def hybrid_context(graph, embeddings, question):
     return context
 
 
-def rerank_results(question, results, top_k=3, method="llm"):
+def rerank_results(question, results, top_k=3, method="llm", llm_model=None):
     """
     Re-rank retrieved results using various methods.
     
@@ -293,17 +313,17 @@ def rerank_results(question, results, top_k=3, method="llm"):
     print(f"🔄 Re-ranking {len(results)} results using {method.upper()}...")
     
     if method == "llm":
-        return _rerank_with_llm(question, results, top_k)
+        return _rerank_with_llm(question, results, top_k, llm_model)
     elif method == "cohere":
         return _rerank_with_cohere(question, results, top_k)
     elif method == "cross-encoder":
         return _rerank_with_cross_encoder(question, results, top_k)
     else:
         print(f"   ⚠️ Unknown reranking method: {method}, using LLM")
-        return _rerank_with_llm(question, results, top_k)
+        return _rerank_with_llm(question, results, top_k, llm_model)
 
 
-def _rerank_with_llm(question, results, top_k=3):
+def _rerank_with_llm(question, results, top_k=3, llm_model=None):
     """Original LLM-based reranking."""
     # Create prompt for LLM to score relevance
     rerank_prompt = f"""You are a relevance scoring system. Given a user question and a text passage, score how relevant the passage is to answering the question.
@@ -330,7 +350,13 @@ For each passage below, respond with ONLY a number (0-10):
         score_prompt = f"{rerank_prompt}\nPassage {idx+1}: {passage}\n\nRelevance score:"
         
         try:
-            response = llm.invoke(score_prompt).content.strip()
+            # Use passed LLM model
+            if llm_model:
+                response = llm_model.invoke(score_prompt).content.strip()
+            else:
+                 # Fallback if somehow None (shouldn't happen with correct plumbing)
+                 print("   ⚠️ No LLM model passed to reranker.")
+                 raise ValueError("LLM model required")
             # Extract numeric score
             relevance_score = float(response.split()[0])  # Get first number
             
@@ -476,15 +502,15 @@ Chat History:
 Follow Up Input: {question}
 Standalone question:"""
         condense_prompt = ChatPromptTemplate.from_template(condense_template)
-        # We need a synchronous LLM call for the condensation
-        standalone_question = llm.invoke(condense_prompt.format(history=history, question=question)).content
+        # Use dynamic_llm for rewrite
+        standalone_question = dynamic_llm.invoke(condense_prompt.format(history=history, question=question)).content
         print(f"   👉 Rewritten: {standalone_question}")
 
     print(f"🤔 Thinking about: {standalone_question}")
     
     # --- Step 2: Retrieve Context using Standalone Question ---
-    # We pass the string directly to the retriever now
-    context = hybrid_context(graph, embeddings, standalone_question)
+    # We pass the string directly to the retriever now, along with the LLM
+    context = hybrid_context(graph, embeddings, standalone_question, llm_model=dynamic_llm)
     
     # --- Step 2.5: Display Cited Images & Sources ---
     def display_images_from_context(text):
@@ -563,7 +589,8 @@ SOURCE ATTRIBUTION:
 
 <response_guidelines>
 - Be helpful, technical, but easy to understand.
-- Use bullet points for features.
+- CRITICAL: If the retrieved information contains technical specifications, numerical comparisons (kW, Amps, Voltage), or list-based data, YOU MUST FORMAT IT AS A MARKDOWN TABLE.
+- Do NOT simply copy the list format from the source. CONVERT lists to Tables.
 - If the user asks about a specific model (e.g., "AION"), look for its specific specs.
 </response_guidelines>
 """

@@ -18,7 +18,18 @@ function App() {
         scrollToBottom();
     }, [messages]);
 
-    // Format message content to preserve tables and line breaks
+    // Helper to parse bold (**text**)
+    const processInlineMarkdown = (text) => {
+        const parts = text.split(/(\*\*.*?\*\*)/g);
+        return parts.map((part, index) => {
+            if (part.startsWith('**') && part.endsWith('**')) {
+                return <strong key={index}>{part.slice(2, -2)}</strong>;
+            }
+            return part;
+        });
+    };
+
+    // Format message content to preserve tables, headers, and bold
     const formatMessage = (content) => {
         // Split by code blocks and tables
         const lines = content.split('\n');
@@ -43,7 +54,20 @@ function App() {
                     inTable = false;
                 }
                 if (line.trim()) {
-                    formatted.push(<div key={idx}>{line}</div>);
+                    // Check for Headers (###)
+                    if (line.startsWith('###')) {
+                        const headerText = line.replace(/^###\s*/, '');
+                        formatted.push(<h3 key={idx}>{processInlineMarkdown(headerText)}</h3>);
+                    }
+                    // Check for Bullet Points
+                    else if (line.trim().startsWith('-')) {
+                        const liText = line.trim().substring(1).trim();
+                        formatted.push(<li key={idx}>{processInlineMarkdown(liText)}</li>);
+                    }
+                    // Normal text
+                    else {
+                        formatted.push(<div key={idx}>{processInlineMarkdown(line)}</div>);
+                    }
                 }
             }
         });
@@ -74,13 +98,13 @@ function App() {
             <table>
                 <thead>
                     <tr>
-                        {headers.map((header, i) => <th key={i}>{header}</th>)}
+                        {headers.map((header, i) => <th key={i}>{processInlineMarkdown(header)}</th>)}
                     </tr>
                 </thead>
                 <tbody>
                     {dataRows.map((row, i) => (
                         <tr key={i}>
-                            {row.map((cell, j) => <td key={j}>{cell}</td>)}
+                            {row.map((cell, j) => <td key={j}>{processInlineMarkdown(cell)}</td>)}
                         </tr>
                     ))}
                 </tbody>

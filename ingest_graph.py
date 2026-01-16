@@ -152,9 +152,9 @@ def get_combined_chunks(docs, chunks_to_combine=3):
     
     return combined
 
-def get_internal_links(base_url, max_links=15):
+def get_internal_links(base_url, max_links=60):
     """
-    Finds internal links using Selenium to handle dynamic JS menus.
+    Recursively crawls up to 2 levels deep to find car model pages.
     """
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
@@ -163,8 +163,7 @@ def get_internal_links(base_url, max_links=15):
     from urllib.parse import urljoin, urlparse
     import time
 
-    print(f"   🕷️ Crawling (RPA) sub-pages for: {base_url}")
-    links_to_visit = set([base_url])
+    print(f"   🕷️ Deep Crawling (2 Levels) starting at: {base_url}")
     
     # Setup Headless Chrome
     chrome_options = Options()
@@ -173,47 +172,96 @@ def get_internal_links(base_url, max_links=15):
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--window-size=1920,1080")
     
+    found_links = set([base_url])
+    queue = [(base_url, 0)] # URL, Depth
+    visited = set()
+    
     try:
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=chrome_options)
         
-        try:
-            driver.get(base_url)
-            time.sleep(3) # Wait for JS to render
+        while queue and len(found_links) < max_links:
+            current_url, depth = queue.pop(0)
             
-            # Extract links from rendered DOM
-            domain = urlparse(base_url).netloc
-            elements = driver.find_elements("tag name", "a")
+            if current_url in visited or depth >= 2:
+                continue
             
-            for elem in elements:
-                try:
-                    href = elem.get_attribute("href")
-                    if not href: continue
-                    
-                    full_url = urljoin(base_url, href)
-                    parsed_url = urlparse(full_url)
-                    
-                    possible_noise = ['about', 'contact', 'legal', 'privacy', 'terms', 'login', 'signup', 'cart', 'facebook', 'twitter', 'linkedin']
-                    if any(x in parsed_url.path.lower() for x in possible_noise):
-                        continue
-
-                    # Strict filtering
-                    if parsed_url.netloc == domain and parsed_url.scheme in ['http', 'https']:
-                        if not any(ext in parsed_url.path.lower() for ext in ['.jpg', '.png', '.pdf', '.zip']):
-                             links_to_visit.add(full_url)
-                    
-                    if len(links_to_visit) >= max_links:
-                        break
-                except:
-                    continue
-                    
-        finally:
-            driver.quit()
+            visited.add(current_url)
+            print(f"      Scanning (Level {depth}): {current_url}")
+            
+            try:
+                driver.get(current_url)
+                time.sleep(2) # Wait for render
                 
-    except Exception as e:
-        print(f"      ⚠️ Crawling failed: {e}")
+                domain = urlparse(base_url).netloc
+                elements = driver.find_elements("tag name", "a")
+                
+                for elem in elements:
+                    try:
+                        href = elem.get_attribute("href")
+                        if not href: continue
+                        
+                        full_url = urljoin(base_url, href)
+                        parsed = urlparse(full_url)
+                        
+                        # Domain check
+                        if parsed.netloc != domain: continue
+                        
+                        # Filter noise
+                        path = parsed.path.lower()
+                        noise = ['about', 'contact', 'cart', 'login', 'facebook', 'line', 'tel:', 'mailto:', 'javascript']
+                        if any(x in path or x in full_url.lower() for x in noise): continue
+                        
+                        # Only add if it looks relevant (EV/Charger/Car)
+                        is_relevant = any(k in full_url.lower() for k in ['ev', 'charger', 'car', 'model', 'spec', 'audi', 'benz', 'bmw', 'mg', 'volvo'])
+                        if not is_relevant and depth > 0: continue
+                        
+                        if full_url not in found_links:
+                            found_links.add(full_url)
+                            # If it's a category/hub page, queue it for next level
+                            # We assume pages with 'ev-charging' might have sub-models
+                            if 'html' in path and depth < 1:
+                                queue.append((full_url, depth + 1))
+                                
+                    except Exception:
+                         continue
+                         
+            except Exception as e:
+                print(f"      ⚠️ Failed to crawl {current_url}: {e}")
+                
+        driver.quit()
         
-    return list(links_to_visit)
+    except Exception as e:
+        print(f"   ⚠️ Crawler failed: {e}")
+        
+    print(f"   ✅ Found {len(found_links)} total pages to scrape.")
+    return list(found_links)
+
+def clean_extracted_images():
+    """Cleans up old extracted images and logs before fresh ingestion."""
+    import shutil
+    
+    print("🧹 Cleaning up old extracted images and logs...")
+    
+    # Clean Images
+    img_dir = Path("data/extracted_images")
+    if img_dir.exists():
+        try:
+            shutil.rmtree(img_dir)
+            img_dir.mkdir(exist_ok=True)
+            print("   ✅ Deleted old data/extracted_images/")
+        except Exception as e:
+            print(f"   ⚠️ Could not clean image dir: {e}")
+            
+    # Clean Logs (Optional, but good for debugging)
+    log_dir = Path("log")
+    if log_dir.exists():
+         try:
+            shutil.rmtree(log_dir)
+            log_dir.mkdir(exist_ok=True)
+            print("   ✅ Deleted old log/")
+         except Exception as e:
+             print(f"   ⚠️ Could not clean log dir: {e}")
 
 def load_web_with_images(url):
     """
@@ -425,8 +473,15 @@ def ingest_data():
     
     # Get all files in data directory
     all_files = glob.glob("data/*")
+    start_time = time.time()
+    
+    # CLEANUP OLD DATA FIRST
+    clean_extracted_images()
     
     docs = []
+    
+    # Process local files
+    print("\n📂 Loading local files from data/ ...")
     
     for file_path in all_files:
         ext = os.path.splitext(file_path)[1].lower()
