@@ -27,8 +27,8 @@ NEO4J_USERNAME = os.getenv('NEO4J_USERNAME')
 NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD')
 
 # API Keys
-OPENAI_API_KEY = os.getenv('OpenAi_api')
-OPENAI_EMB_KEY = os.getenv('OpenAi_api_embbeding') or OPENAI_API_KEY
+OPENAI_API_KEY = os.getenv('OpenAi_api_key')
+OPENAI_EMB_KEY = os.getenv('OpenAi_api_key')
 OPENAI_BASE_URL = 'https://aigateway.ntictsolution.com/v1'
 
 def clean_graph_schema(graph):
@@ -409,7 +409,7 @@ def ingest_data():
     llm = ChatOpenAI(
         api_key=OPENAI_API_KEY,
         base_url=OPENAI_BASE_URL,
-        model='gpt-4o',
+        model='gpt-4o-mini',
         temperature=0
     )
 

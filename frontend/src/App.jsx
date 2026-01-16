@@ -7,6 +7,7 @@ function App() {
     const [loading, setLoading] = useState(false);
     const [sessionId] = useState(() => Math.random().toString(36).substr(2, 9));
     const [lightboxImage, setLightboxImage] = useState(null);
+    const [isCreative, setIsCreative] = useState(true); // Default to Creative (0.3)
     const messagesEndRef = useRef(null);
 
     const scrollToBottom = () => {
@@ -98,12 +99,15 @@ function App() {
         setLoading(true);
 
         try {
+            // Use relative path for production (handled by proxy in dev)
+            // Use absolute URL to force connection to backend
             const response = await fetch('http://localhost:8000/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     message: userMessage,
-                    session_id: sessionId
+                    session_id: sessionId,
+                    temperature: isCreative ? 0.3 : 0.0
                 })
             });
 
@@ -157,8 +161,19 @@ function App() {
         <div className="App">
             <div className="chat-container">
                 <div className="chat-header">
-                    <h1>🧠 Hybrid RAG Chatbot</h1>
-                    <button onClick={clearChat} className="clear-btn">Clear Chat</button>
+                    <h1>🧠 EV Charger Expert AI</h1>
+                    <div className="controls">
+                        <label className="mode-toggle">
+                            <input
+                                type="checkbox"
+                                checked={isCreative}
+                                onChange={(e) => setIsCreative(e.target.checked)}
+                            />
+                            <span className="slider"></span>
+                            <span className="label-text">{isCreative ? 'Creative (0.3)' : 'Strict (0.0)'}</span>
+                        </label>
+                        <button onClick={clearChat} className="clear-btn">Clear Chat</button>
+                    </div>
                 </div>
 
                 <div className="messages-container">

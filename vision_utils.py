@@ -6,19 +6,51 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_KEY = os.getenv('OpenAi_api')
+API_KEY = os.getenv('OpenAi_api_key')
 BASE_URL = 'https://aigateway.ntictsolution.com/v1/chat/completions' # Explicitly using chat/completions for direct calls
 
+from PIL import Image
+import io
+
+def compress_image(image_input, max_size=(1024, 1024), quality=85):
+    """Resizes and compresses image to avoid 413/400 API errors."""
+    try:
+        # Open image from path or bytes
+        if isinstance(image_input, str):
+            img = Image.open(image_input)
+        else:
+            img = Image.open(io.BytesIO(image_input))
+            
+        # Convert to RGB (fixes RGBA issues with JPEG)
+        if img.mode in ('RGBA', 'P'):
+            img = img.convert('RGB')
+            
+        # Resize if too big
+        img.thumbnail(max_size, Image.Resampling.LANCZOS)
+        
+        # Save to buffer
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=quality)
+        return buffer.getvalue()
+    except Exception as e:
+        print(f"      ⚠️ Image compression failed: {e}")
+        return None
+
 def encode_image_from_file(image_path):
-    """Encodes a local image file to base64."""
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+    """Encodes a local image file to base64 with compression."""
+    compressed_bytes = compress_image(image_path)
+    if compressed_bytes:
+        return base64.b64encode(compressed_bytes).decode('utf-8')
+    return ""
 
 def encode_image_from_bytes(image_bytes):
-    """Encodes in-memory image bytes to base64."""
-    return base64.b64encode(image_bytes).decode('utf-8')
+    """Encodes in-memory image bytes to base64 with compression."""
+    compressed_bytes = compress_image(image_bytes)
+    if compressed_bytes:
+        return base64.b64encode(compressed_bytes).decode('utf-8')
+    return ""
 
-def describe_image(base64_image, prompt="Describe this image in detail in English (PLAIN TEXT ONLY, NO MARKDOWN BOLDING). If it contains text in another language, translate it to English. If it is a chart or table, extract the data.", save_description_path=None):
+def describe_image(base64_image, prompt="Describe this image in detail. CRITICAL: If the image contains technical specifications, numbers, or comparison data, YOU MUST output it as a Markdown Table. Do not use lists for data. If it is a generic photo, just describe it.", save_description_path=None):
     """
     Sends detailed image description request to GPT-4o-Vision.
     Returns the text description.
@@ -38,7 +70,7 @@ def describe_image(base64_image, prompt="Describe this image in detail in Englis
     }
 
     payload = {
-        "model": "gpt-4o",
+        "model": "ict-vllm/typhoon-ocr-1-5",
         "messages": [
             {
                 "role": "user",
@@ -50,8 +82,8 @@ def describe_image(base64_image, prompt="Describe this image in detail in Englis
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}",
-                            "detail": "high" 
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                            # Removed "detail": "high" to prevent errors
                         }
                     }
                 ]

@@ -2,51 +2,29 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os
 from dotenv import load_dotenv
-from langchain_community.graphs import Neo4jGraph
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 import re
 
-# Import the answer function from run_qa
+# Import the answer function AND initializer from run_qa
+from run_qa import answer, initialize_reranker
 import sys
 sys.path.append(os.path.dirname(__file__))
 
 # Load environment
 load_dotenv()
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='frontend/build', static_url_path='/')
 CORS(app)  # Enable CORS for React frontend
 
 # Initialize Neo4j and models (same as run_qa.py)
 NEO4J_URI = os.getenv('NEO4J_URI')
 NEO4J_USERNAME = os.getenv('NEO4J_USERNAME')
 NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD')
-OPENAI_API_KEY = os.getenv('OpenAi_api')
-OPENAI_EMB_KEY = os.getenv('OpenAi_api_embbeding') or OPENAI_API_KEY
+OPENAI_API_KEY = os.getenv('OpenAi_api_key')
+OPENAI_EMB_KEY = os.getenv('OpenAi_api_key')
 OPENAI_BASE_URL = 'https://aigateway.ntictsolution.com/v1'
 
-graph = Neo4jGraph(
-    url=NEO4J_URI,
-    username=NEO4J_USERNAME,
-    password=NEO4J_PASSWORD
-)
-
-llm = ChatOpenAI(
-    api_key=OPENAI_API_KEY,
-    base_url=OPENAI_BASE_URL,
-    model='gpt-4o',
-    temperature=0
-)
-
-embeddings = OpenAIEmbeddings(
-    api_key=OPENAI_EMB_KEY,
-    base_url=OPENAI_BASE_URL,
-    model='text-embedding-3-large'
-)
-
-# Import functions from run_qa
-from run_qa import hybrid_context, answer
+# OpenAI Configuration (for Embeddings if needed elsewhere, though run_qa handles it)
+# Currently api.py handles routing, run_qa handles logic.
 
 # Store chat sessions (in production, use Redis or database)
 chat_sessions = {}
@@ -70,9 +48,10 @@ def chat():
             chat_sessions[session_id] = ""
         
         history = chat_sessions[session_id]
+        temperature = data.get('temperature', 0)
         
         # Get answer (returns dict with result and context)
-        output = answer(user_message, history=history)
+        output = answer(user_message, history=history, temperature=temperature)
         bot_response = output['result']
         context = output['context']
         
@@ -166,8 +145,20 @@ def health():
 
 @app.route('/')
 def index():
-    """Root endpoint to verify server is running"""
-    return "<h1>✅ Hybrid RAG API is Running!</h1><p>Use the frontend at <a href='http://localhost:3000'>http://localhost:3000</a> to chat.</p>"
+    """Serve React App in Production"""
+    if os.path.exists(app.static_folder):
+        return send_from_directory(app.static_folder, 'index.html')
+    else:
+        return "<h1>✅ Hybrid RAG API is Running!</h1><p>Frontend build not found. Run 'npm run build' in frontend/ first.</p>"
+
+@app.route('/<path:path>')
+def serve_static(path):
+    """Serve static files for React"""
+    if os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
+    else:
+        # Return index.html for client-side routing
+        return send_from_directory(app.static_folder, 'index.html')
 
 @app.route('/images/<path:filename>')
 def serve_image(filename):
@@ -209,13 +200,21 @@ if __name__ == '__main__':
     # Register cleanup to run when the script exits (Ctrl+C)
     atexit.register(cleanup)
     
-    # Start frontend in background
-    threading.Thread(target=start_frontend, daemon=True).start()
+    # Start frontend in background (ONLY IN DEV/WINDOWS)
+    if os.name == 'nt' or os.environ.get('FLASK_ENV') == 'development':
+        threading.Thread(target=start_frontend, daemon=True).start()
+    else:
+        print("🐧 Linux/Production Mode: Expecting React 'build' folder to be served.")
     
     print("🚀 Starting RAG API Server...")
+    
+    # Initialize Reranker (Load Model)
+    initialize_reranker()
+    
     print("📡 API available at: http://localhost:8000")
     try:
-        app.run(debug=True, port=8000, use_reloader=False) # use_reloader=False prevents double process spawning
+        # run on 0.0.0.0 for linux server access
+        app.run(host='0.0.0.0', debug=True, port=8000, use_reloader=False)
     except KeyboardInterrupt:
         pass # Handle manual stop cleanly
     

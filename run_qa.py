@@ -21,22 +21,32 @@ graph = Neo4jGraph(
 )
 
 # 3. Initialize Models
-llm = ChatOpenAI(
-    api_key=os.getenv("OpenAi_api"),
-    base_url="https://aigateway.ntictsolution.com/v1",
-    model="gpt-4o",
-    temperature=0
-)
+# llm is now created dynamically in answer()
 
 embeddings = OpenAIEmbeddings(
      model="text-embedding-3-large", 
      openai_api_base="https://aigateway.ntictsolution.com/v1",
-     openai_api_key=os.getenv("OpenAi_api_embbeding")
+     openai_api_key=os.getenv("OpenAi_api_key")
 )
 
 # Reranker configuration
 RERANKER_METHOD = os.getenv("RERANKER_METHOD", "llm").lower()  # Options: "llm", "cohere", "cross-encoder"
 print(f"🔧 Using reranker: {RERANKER_METHOD.upper()}")
+
+# Global Cache for Cross-Encoder
+_CROSS_ENCODER_MODEL = None
+
+def initialize_reranker():
+    """Preloads the reranker model to avoid cold start latency."""
+    global _CROSS_ENCODER_MODEL
+    if RERANKER_METHOD == "cross-encoder" and _CROSS_ENCODER_MODEL is None:
+        try:
+            from sentence_transformers import CrossEncoder
+            print("   ⏳ Pre-loading Cross-Encoder model...")
+            _CROSS_ENCODER_MODEL = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+            print("   ✅ Cross-Encoder model loaded!")
+        except Exception as e:
+            print(f"   ⚠️ Failed to preload Cross-Encoder: {e}")
 
 # 4. Define Retrieval Function
 
@@ -399,9 +409,14 @@ def _rerank_with_cross_encoder(question, results, top_k=3):
     """Rerank using local cross-encoder model (requires sentence-transformers)."""
     try:
         from sentence_transformers import CrossEncoder
+        global _CROSS_ENCODER_MODEL
         
         # Load cross-encoder model (cached after first load)
-        model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        if _CROSS_ENCODER_MODEL is None:
+            print("   ⏳ Loading Cross-Encoder model (one-time cost)...")
+            _CROSS_ENCODER_MODEL = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+            
+        model = _CROSS_ENCODER_MODEL
         
         # Prepare pairs for scoring
         pairs = [[question, r['text'][:512]] for r in results]  # Limit text length
@@ -439,9 +454,17 @@ def _rerank_with_cross_encoder(question, results, top_k=3):
 
 
 
-def answer(question, history=""):
+def answer(question, history="", temperature=0.3):
     """Final QA function using LCEL."""
-    print(f"🤔 Thinking about: {question}")
+    print(f"🤔 Thinking about: {question} (Temp: {temperature})")
+    
+    # Create dynamic LLM with requested temp
+    dynamic_llm = ChatOpenAI(
+        api_key=os.getenv("OpenAi_api"),
+        base_url="https://aigateway.ntictsolution.com/v1",
+        model="gpt-4o-mini",
+        temperature=temperature
+    )
     
     # --- Step 1: Condense Question (if history exists) ---
     standalone_question = question
@@ -503,36 +526,27 @@ Standalone question:"""
     display_sources_from_context(context)
     
     # --- Step 3: Generate Answer ---
-    template = """You are an intelligent AI assistant for a Formula 1 Knowledge Base.
+    template = """You are an intelligent AI assistant acting as an **Expert Technical Support Agent for EV Chargers**.
     
 <instruction>
-Please answer the user's question based ONLY on the provided context.
+Please answer the user's question based **ONLY** on the provided context.
 
 STRATEGY (Chain of Thought):
-1. **Analyze** the user's question to understand the core intent (e.g., specific fact, comparison, or summary).
-2. **Scan** the <context> specifically for this information.
-3. **Verify** that the data in the context directly supports your answer. If data is conflicting, cite the most recent source.
-4. **Draft** your response in the requested language.
+1. **Analyze** if the question is about EV Chargers, Specifications, or Installation.
+2. **Scan** the <context> for technical details (Voltage, KW, Amps, Connector Types).
+3. **Verify** matches between the user's vehicle/request and the charger specs in the context.
+4. **Draft** your response in the requested language (Thai/English).
 
 CRITICAL RULES:
 - **Language:** Answer in the SAME language as the <question> (English -> English, Thai -> Thai).
-- **No Hallucination:** If the answer is not in <context>, say you don't know. Do NOT make up facts.
-- **Clarification:** If the <context> represents a partial match (e.g., 2023 data instead of 2024), explicitly ask the user if they want that info.
+- **No Hallucination:** If the answer is not in <context>, politely say you don't have that specific information.
+- **Tables:** If providing technical comparisons (e.g., AC vs DC, 7kW vs 22kW), **YOU MUST** use a Markdown Table.
+- **Images:** If you see [IMAGE PATH: ...] in the context, mention that you have found a relevant image/diagram.
 
 SOURCE ATTRIBUTION:
-- When presenting specific stats (e.g., "Max won 15 races"), cite the source if available in the text.
-- Tech Specs: Use bolding for technical terms (e.g., **Dive Plane**) found in image descriptions.
+- Rely heavily on the provided text chunks.
+- If data comes from an image description (labeled as 'DETECTED IMAGES'), trust it as visual evidence.
 
-IMAGES:
-- If <context> mentions [IMAGE PATH: ...], tell the user "I have opened relevant images for you."
-
-TABLE LOGIC (Chain of Table):
-- If your answer is derived from a table, **YOU MUST** display relevant rows as a Markdown Table.
-- **DO NOT** just summarize the result in a sentence (e.g., "Max was first").
-- **DO** show:
-  | Driver | Position |
-  |--------|----------|
-  | Max    | 1        |
 </instruction>
 
 <history>
@@ -548,10 +562,9 @@ TABLE LOGIC (Chain of Table):
 </question>
 
 <response_guidelines>
-- Take a deep breath and think step by step.
-- Be concise but complete.
-- Explain technical terms simply (ELI5 style).
-- **FORMATTING:** Use PLAIN TEXT for narrative (no bolding/headers). **EXCEPTION:** You MUST use Markdown Tables for tabular data.
+- Be helpful, technical, but easy to understand.
+- Use bullet points for features.
+- If the user asks about a specific model (e.g., "AION"), look for its specific specs.
 </response_guidelines>
 """
 
@@ -560,7 +573,7 @@ TABLE LOGIC (Chain of Table):
     # We construct the final chain manually for clarity
     final_chain = (
         prompt 
-        | llm 
+        | dynamic_llm 
         | StrOutputParser()
     )
     
