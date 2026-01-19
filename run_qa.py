@@ -71,9 +71,10 @@ def extract_entities(llm, question: str) -> list:
 
     Question: {question}
     """
+    print(f"   🧠 Asking LLM to extract entities from: {question}")
     response = llm.invoke(prompt).content
     terms = [t.strip() for t in response.split(',') if t.strip()]
-    print(f"🧩 Extracted search terms: {terms}")
+    print(f"   🧩 Extracted search terms: {terms}")
     return terms
 
 def retrieve_graph_context(graph, llm, question: str, limit: int = 15) -> str:
@@ -83,6 +84,8 @@ def retrieve_graph_context(graph, llm, question: str, limit: int = 15) -> str:
     create_fulltext_index(graph)
 
     # 2. Extract Search Terms (e.g. "Max", "Red Bull")
+    # 2. Extract Search Terms (e.g. "Max", "Red Bull")
+    print("   ...Calling extract_entities...")
     search_terms = extract_entities(llm, question)
     if not search_terms:
         return ""
@@ -105,7 +108,9 @@ def retrieve_graph_context(graph, llm, question: str, limit: int = 15) -> str:
     """
     
     try:
+        print(f"   ...Running Cypher Query: {lucene_query}")
         results = graph.query(cypher_query, {"query": lucene_query})
+        print(f"   ✅ Graph Query returned {len(results)} rows.")
         return "\n".join([row['output'] for row in results])
     except Exception as e:
         print(f"⚠️ Graph search failed: {e}")
@@ -229,6 +234,33 @@ def hybrid_context(graph, embeddings, question, llm_model):
         is_img_file = lambda r: r.get('source', '').lower().endswith(('.jpg', '.jpeg', '.png'))
         image_file_results = [r for r in vector_ctx if is_img_file(r)]
         
+        # --- STRICT IMAGE FILTERING ---
+        # Reload config
+        load_trust_config()
+        is_strict = TRUST_CONFIG.get("strict_mode", True)
+        
+        # If question has specific keywords (Audi, BMW, MG), only allow images mentioning them.
+        important_keywords = [w.lower() for w in question.split() if len(w) > 2 and w.lower() not in ['what', 'where', 'when', 'how', 'spec', 'data', 'info', 'show', 'give']]
+        
+        if is_strict and important_keywords and image_file_results:
+            strict_images = []
+            for img in image_file_results:
+                desc = img.get('text', '').lower()
+                src = img.get('source', '').lower()
+                # Check if ANY keyword hits the description or source
+                if any(k in desc or k in src for k in important_keywords):
+                    strict_images.append(img)
+            
+            if strict_images:
+                print(f"   🛡️ Strict Filter: Reduced {len(image_file_results)} images to {len(strict_images)} relevant ones.")
+                image_file_results = strict_images
+            else:
+                 print("   🛡️ Strict Filter: No images matched keywords. Keeping original candidates (risky).")
+
+        # Re-assemble vector_ctx to include filtered images + text
+        text_results = [r for r in vector_ctx if not is_img_file(r)]
+        vector_ctx = text_results + image_file_results
+        
         # Rerank everything
         reranked = rerank_results(question, vector_ctx, top_k=5, method=RERANKER_METHOD, llm_model=llm_model)
         
@@ -293,6 +325,47 @@ def hybrid_context(graph, embeddings, question, llm_model):
 
     return context
 
+# --- TRUST SCORE LOGIC ---
+TRUST_CONFIG = {}
+def load_trust_config():
+    global TRUST_CONFIG
+    import json
+    try:
+        if os.path.exists("data/source_config.json"):
+            with open("data/source_config.json", "r") as f:
+                TRUST_CONFIG = json.load(f)
+            print("   ✅ Loaded Trust Configuration.")
+        else:
+            print("   ⚠️ No Trust Config found, using defaults.")
+    except Exception as e:
+        print(f"   ⚠️ Error loading trust config: {e}")
+
+def get_trust_multiplier(source_name):
+    """Calculates trust score (0.0 - 1.0) based on source name."""
+    if not TRUST_CONFIG: load_trust_config()
+    
+    rules = TRUST_CONFIG.get("rules", [])
+    default = TRUST_CONFIG.get("default_score", 0.5)
+    
+    source = str(source_name).lower()
+    
+    # Logic: Find the LONGEST matching pattern (e.g., 'file.pdf' overrides '.pdf')
+    best_score = float(default)
+    max_len = -1
+    
+    for rule in rules:
+        pattern = rule.get("pattern", "").lower()
+        if pattern and pattern in source:
+            # If this match is more specific (longer) than previous, use it
+            if len(pattern) > max_len:
+                max_len = len(pattern)
+                best_score = float(rule.get("score", 1.0))
+                
+    return best_score
+            
+    return float(default)
+# -------------------------
+
 
 def rerank_results(question, results, top_k=3, method="llm", llm_model=None):
     """
@@ -311,6 +384,9 @@ def rerank_results(question, results, top_k=3, method="llm", llm_model=None):
         return results
     
     print(f"🔄 Re-ranking {len(results)} results using {method.upper()}...")
+    
+    # Reload trust config on every request (to support live editing)
+    load_trust_config()
     
     if method == "llm":
         return _rerank_with_llm(question, results, top_k, llm_model)
@@ -361,12 +437,17 @@ For each passage below, respond with ONLY a number (0-10):
             relevance_score = float(response.split()[0])  # Get first number
             
             # Combine with original vector score (weighted average)
-            combined_score = (relevance_score / 10.0) * 0.7 + result.get('score', 0.5) * 0.3
+            base_score = (relevance_score / 10.0) * 0.7 + result.get('score', 0.5) * 0.3
+            
+            # Apply Trust Multiplier
+            trust = get_trust_multiplier(result.get('source', ''))
+            final_score = base_score * trust
             
             scored_results.append({
                 **result,
                 'relevance_score': relevance_score,
-                'combined_score': combined_score
+                'trust_score': trust,
+                'combined_score': final_score
             })
         except Exception as e:
             print(f"   ⚠️ Re-ranking failed for result {idx+1}: {e}")
@@ -424,10 +505,10 @@ def _rerank_with_cohere(question, results, top_k=3):
         return reranked
         
     except ImportError:
-        print("   ⚠️ Cohere library not installed. Run: pip install cohere")
+        print("   [WARN] Cohere library not installed. Run: pip install cohere")
         return _rerank_with_llm(question, results, top_k)
     except Exception as e:
-        print(f"   ⚠️ Cohere reranking failed: {e}, falling back to LLM")
+        print(f"   [WARN] Cohere reranking failed: {e}, falling back to LLM")
         return _rerank_with_llm(question, results, top_k)
 
 
@@ -439,7 +520,7 @@ def _rerank_with_cross_encoder(question, results, top_k=3):
         
         # Load cross-encoder model (cached after first load)
         if _CROSS_ENCODER_MODEL is None:
-            print("   ⏳ Loading Cross-Encoder model (one-time cost)...")
+            print("   [INFO] Loading Cross-Encoder model (one-time cost)...")
             _CROSS_ENCODER_MODEL = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
             
         model = _CROSS_ENCODER_MODEL
@@ -453,25 +534,31 @@ def _rerank_with_cross_encoder(question, results, top_k=3):
         # Combine with original scores
         scored_results = []
         for idx, (result, ce_score) in enumerate(zip(results, scores)):
-            combined_score = ce_score * 0.7 + result.get('score', 0.5) * 0.3
+            base_score = ce_score * 0.7 + result.get('score', 0.5) * 0.3
+            
+            # Apply Trust Multiplier
+            trust = get_trust_multiplier(result.get('source', ''))
+            final_score = base_score * trust
+            
             scored_results.append({
                 **result,
                 'relevance_score': float(ce_score),
-                'combined_score': float(combined_score)
+                'trust_score': trust,
+                'combined_score': float(final_score)
             })
         
         # Sort and return top_k
         scored_results.sort(key=lambda x: x['combined_score'], reverse=True)
         top_results = scored_results[:top_k]
         
-        print(f"   ✅ Kept top {len(top_results)} most relevant results")
+        print(f"   [INFO] Kept top {len(top_results)} most relevant results")
         return top_results
         
     except ImportError:
-        print("   ⚠️ sentence-transformers not installed. Run: pip install sentence-transformers")
+        print("   [WARN] sentence-transformers not installed. Run: pip install sentence-transformers")
         return _rerank_with_llm(question, results, top_k)
     except Exception as e:
-        print(f"   ⚠️ Cross-encoder reranking failed: {e}, falling back to LLM")
+        print(f"   [WARN] Cross-encoder reranking failed: {e}, falling back to LLM")
         return _rerank_with_llm(question, results, top_k)
 
 
@@ -482,11 +569,11 @@ def _rerank_with_cross_encoder(question, results, top_k=3):
 
 def answer(question, history="", temperature=0.3):
     """Final QA function using LCEL."""
-    print(f"🤔 Thinking about: {question} (Temp: {temperature})")
+    print(f"[INFO] Thinking about: {question} (Temp: {temperature})")
     
     # Create dynamic LLM with requested temp
     dynamic_llm = ChatOpenAI(
-        api_key=os.getenv("OpenAi_api"),
+        api_key=os.getenv("OpenAi_api_key"),
         base_url="https://aigateway.ntictsolution.com/v1",
         model="gpt-4o-mini",
         temperature=temperature
@@ -495,7 +582,7 @@ def answer(question, history="", temperature=0.3):
     # --- Step 1: Condense Question (if history exists) ---
     standalone_question = question
     if history:
-        print("🤔 Rewriting question based on history...")
+        print("[INFO] Rewriting question based on history...")
         condense_template = """Given the chat history and a follow-up question, rephrase the follow-up question to be a standalone question.
 Chat History:
 {history}
@@ -504,9 +591,9 @@ Standalone question:"""
         condense_prompt = ChatPromptTemplate.from_template(condense_template)
         # Use dynamic_llm for rewrite
         standalone_question = dynamic_llm.invoke(condense_prompt.format(history=history, question=question)).content
-        print(f"   👉 Rewritten: {standalone_question}")
+        print(f"   [INFO] Rewritten: {standalone_question}")
 
-    print(f"🤔 Thinking about: {standalone_question}")
+    print(f"[INFO] Thinking about: {standalone_question}")
     
     # --- Step 2: Retrieve Context using Standalone Question ---
     # We pass the string directly to the retriever now, along with the LLM

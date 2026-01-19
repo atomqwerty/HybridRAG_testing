@@ -152,7 +152,7 @@ def get_combined_chunks(docs, chunks_to_combine=3):
     
     return combined
 
-def get_internal_links(base_url, max_links=60):
+def get_internal_links(base_url, max_links=200):
     """
     Recursively crawls up to 2 levels deep to find car model pages.
     """
@@ -183,7 +183,7 @@ def get_internal_links(base_url, max_links=60):
         while queue and len(found_links) < max_links:
             current_url, depth = queue.pop(0)
             
-            if current_url in visited or depth >= 2:
+            if current_url in visited or depth >= 3:
                 continue
             
             visited.add(current_url)
@@ -191,7 +191,7 @@ def get_internal_links(base_url, max_links=60):
             
             try:
                 driver.get(current_url)
-                time.sleep(2) # Wait for render
+                time.sleep(3) # Wait for render (Increased for safety)
                 
                 domain = urlparse(base_url).netloc
                 elements = driver.find_elements("tag name", "a")
@@ -220,8 +220,18 @@ def get_internal_links(base_url, max_links=60):
                             found_links.add(full_url)
                             # If it's a category/hub page, queue it for next level
                             # We assume pages with 'ev-charging' might have sub-models
-                            if 'html' in path and depth < 1:
-                                queue.append((full_url, depth + 1))
+                            if 'html' in path and depth < 2:
+                                priority_score = 0
+                                if any(x in path for x in ['2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025']):
+                                    priority_score = 2 # High priority (Specific Model Year)
+                                elif any(x in path for x in ['spec', 'model']):
+                                    priority_score = 1 # Medium priority
+                                
+                                # Insert based on priority (Pseudo-Priority Queue)
+                                if priority_score > 0:
+                                    queue.insert(0, (full_url, depth + 1))
+                                else:
+                                    queue.append((full_url, depth + 1))
                                 
                     except Exception:
                          continue

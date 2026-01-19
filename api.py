@@ -3,6 +3,7 @@ from flask_cors import CORS
 import os
 from dotenv import load_dotenv
 import re
+import json # Added for config handling
 
 # Import the answer function AND initializer from run_qa
 from run_qa import answer, initialize_reranker
@@ -196,21 +197,106 @@ def start_frontend():
     # Use shell=True for Windows compatibility
     frontend_process = subprocess.Popen('npm start', cwd=frontend_dir, shell=True)
 
+# --- Trust Config Endpoints ---
+@app.route('/api/config/trust', methods=['GET'])
+def get_trust_config():
+    """Returns the current trust configuration."""
+    config_path = "data/source_config.json"
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            return jsonify(json.load(f))
+    return jsonify({"rules": [], "default_score": 0.5})
+
+@app.route('/api/config/trust', methods=['POST'])
+def save_trust_config():
+    """Updates the trust configuration."""
+    try:
+        new_config = request.json
+        config_path = "data/source_config.json"
+        with open(config_path, "w") as f:
+            json.dump(new_config, f, indent=4)
+        return jsonify({"status": "success", "message": "Trust config saved"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+@app.route('/api/source', methods=['DELETE'])
+def delete_source_data():
+    """Removes a rule AND deletes all associated data from Neo4j."""
+    try:
+        data = request.json
+        pattern = data.get('pattern')
+        if not pattern:
+            return jsonify({"error": "Pattern is required"}), 400
+            
+        print(f"[INFO] Requesting to PURGE data for source pattern: {pattern}")
+        
+        # 1. Delete from Neo4j
+        from run_qa import graph # Import graph instance
+        # Delete Chunks
+        q1 = """
+        MATCH (n:Chunk) WHERE n.source CONTAINS $pattern 
+        DETACH DELETE n
+        """
+        # Delete Entities (optional, usually entities are shared, so maybe just unlink? 
+        # But user said 'delete it from all database'. Let's stick to Chunks first to be safe 
+        # because Entities might be shared. If an Entity ONLY comes from this source, it's hard to track.
+        # Let's delete Chunks and Images.)
+        
+        # We will count deleted nodes
+        # Using simple session execution if graph object doesn't support stats easily
+        # But 'graph.query' works.
+        
+        graph.query(q1, {"pattern": pattern})
+        
+        # Also clean up configuration
+        config_path = "data/source_config.json"
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            
+            # Remove rule
+            config['rules'] = [r for r in config.get('rules', []) if r.get('pattern') != pattern]
+            
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=4)
+                
+        return jsonify({"status": "success", "message": f"Purged data and rules for '{pattern}'"})
+
+    except Exception as e:
+        print(f"[ERROR] Delete failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/files', methods=['GET'])
+def list_files():
+    """Lists available PDF files from the knowledge graph."""
+    try:
+        from run_qa import graph
+        query = """
+        MATCH (n:Chunk) 
+        WHERE n.source ENDS WITH '.pdf' OR n.source ENDS WITH '.PDF'
+        RETURN DISTINCT n.source as source
+        LIMIT 100
+        """
+        results = graph.query(query)
+        # Extract just the filename for display, or full path?
+        # Storing full path is better for matching.
+        files = sorted([r['source'] for r in results])
+        return jsonify({"files": files})
+    except Exception as e:
+        print(f"❌ Failed to list files: {e}")
+        return jsonify({"error": str(e)}), 500
+# ------------------------------
+
 if __name__ == '__main__':
-    # Register cleanup to run when the script exits (Ctrl+C)
-    atexit.register(cleanup)
+    # Initialize Reranker on Startup
+    initialize_reranker()
     
-    # Start frontend in background (ONLY IN DEV/WINDOWS)
-    if os.name == 'nt' or os.environ.get('FLASK_ENV') == 'development':
-        threading.Thread(target=start_frontend, daemon=True).start()
+    # Auto-start Frontend if not running on Linux/Production
+    if os.name == 'nt' or os.getenv('FLASK_ENV') == 'development':
+         start_frontend()
     else:
         print("🐧 Linux/Production Mode: Expecting React 'build' folder to be served.")
     
     print("🚀 Starting RAG API Server...")
-    
-    # Initialize Reranker (Load Model)
-    initialize_reranker()
-    
     print("📡 API available at: http://localhost:8000")
     try:
         # run on 0.0.0.0 for linux server access

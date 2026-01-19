@@ -46,3 +46,4 @@ data/extracted_images
 Test
 __pycache__
 /data
+check_url_ingestion.py
