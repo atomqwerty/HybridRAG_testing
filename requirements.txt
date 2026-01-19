@@ -11,3 +11,8 @@ pillow
 pypdf
 requests
 beautifulsoup4
+pdfplumber
+langchain-experimental
+docx2txt
+sentence-transformers
+tiktoken
