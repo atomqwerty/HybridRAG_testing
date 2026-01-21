@@ -13,6 +13,7 @@ selenium
 webdriver-manager
 requests
 beautifulsoup4
+pymupdf4llm
 pdfplumber
 langchain-experimental
 docx2txt

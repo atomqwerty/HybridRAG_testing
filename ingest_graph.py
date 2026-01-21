@@ -18,6 +18,7 @@ from langchain_core.documents import Document
 import pdfplumber
 from vision_utils import describe_image, encode_image_from_bytes, encode_image_from_file
 from crawler import get_internal_links, get_links_from_sitemap, load_web_with_images, clean_extracted_images
+from database import get_db_connection, create_vector_index, create_fulltext_index, get_existing_sources
 
 # Load environment variables
 load_dotenv()
@@ -102,34 +103,6 @@ def enrich_communities(graph):
     except Exception as e:
         print(f"   ⚠️ GDS Community Detection failed (GDS plugin might be missing or graph empty): {e}")
 
-def create_indexes(graph):
-    """Creates Fulltext and Vector Indexes for high-performance retrieval."""
-    print("🔍 Creating Indexes...")
-    
-    # 1. Vector Index for Chunks
-    try:
-        graph.query("""
-            CREATE VECTOR INDEX doc_embedding IF NOT EXISTS
-            FOR (c:Chunk) ON (c.embedding)
-            OPTIONS {indexConfig: {
-                `vector.dimensions`: 3072,
-                `vector.similarity_function`: 'cosine'
-            }}
-        """)
-        print("   ✅ Vector Index 'doc_embedding' created.")
-    except Exception as e:
-        print(f"   ⚠️ Vector index error: {e}")
-
-    # 2. Fulltext Index for Entities (Smart Search)
-    try:
-        graph.query("""
-            CREATE FULLTEXT INDEX entity_id_index IF NOT EXISTS 
-            FOR (n:Entity) ON EACH [n.id]
-        """)
-        print("   ✅ Fulltext Index 'entity_id_index' created.")
-    except Exception as e:
-        print(f"   ⚠️ Fulltext index error: {e}")
-
 def get_combined_chunks(docs, chunks_to_combine=3):
     """
     Combines multiple chunks into a single document to provide more context 
@@ -153,15 +126,7 @@ def get_combined_chunks(docs, chunks_to_combine=3):
     
     return combined
 
-def get_existing_sources(graph):
-    """Retrieves a set of source identifiers (filenames/URLs) already in the database."""
-    try:
-        # Check Chunk sources (most reliable indicator of ingestion)
-        data = graph.query("MATCH (c:Chunk) RETURN DISTINCT c.source AS source")
-        return set(record['source'] for record in data)
-    except Exception as e:
-        print(f"   ⚠️ Could not fetch existing sources: {e}")
-        return set()
+# Database functions moved to database.py
 
 # Web crawling and scraping functions have been moved to crawler.py
 
@@ -170,18 +135,10 @@ def ingest_data():
     print("🚀 Starting ULTIMATE Hybrid RAG Data Ingestion...")
     
     # --- 1. Connect ---
+    # --- 1. Connect ---
     try:
-        graph = Neo4jGraph(
-            url=NEO4J_URI,
-            username=NEO4J_USERNAME,
-            password=NEO4J_PASSWORD
-        )
+        graph = get_db_connection()
         print("✅ Connected to Neo4j")
-        
-        # Clear existing data for a fresh start with PDFPlumber
-        # print("🧹 Clearing existing database to ensure clean table ingestion...")
-        # graph.query("MATCH (n) DETACH DELETE n")
-        # print("   ✅ Database cleared.")
         
     except Exception as e:
         print(f"❌ Failed to connect to Neo4j: {e}")
@@ -227,83 +184,55 @@ def ingest_data():
         
         try:
             if ext == '.pdf':
-                print(f"   - Loading PDF (Multimodal): {os.path.basename(file_path)}")
-                
-                with pdfplumber.open(file_path) as pdf:
-                    for i, page in enumerate(pdf.pages):
-                        # 1. Extract Text
-                        text = page.extract_text() or ""
-                        
-                        # 2. Extract Tables (The "Secret Weapon")
-                        tables = page.extract_tables()
-                        table_text = ""
-                        if tables:
-                            print(f"      📊 Found {len(tables)} table(s) on page {i+1}")
-                            for table in tables:
-                                # Convert table to Markdown format
-                                # Filter out None values and empty rows
-                                clean_table = [[cell or "" for cell in row] for row in table if any(row)]
-                                if clean_table:
-                                    # Create header and rows
-                                    try:
-                                        # Simple markdown conversion
-                                        header = "| " + " | ".join(clean_table[0]) + " |"
-                                        separator = "| " + " | ".join(["---"] * len(clean_table[0])) + " |"
-                                        body = "\n".join(["| " + " | ".join(row) + " |" for row in clean_table[1:]])
-                                        table_markdown = f"\n\n### TABLE DATA (Page {i+1}):\n{header}\n{separator}\n{body}\n"
-                                        table_text += table_markdown
-                                    except Exception as e:
-                                        print(f"      ⚠️ Could not format table: {e}")
+                print(f"   - Loading PDF (High-Fidelity Markdown): {os.path.basename(file_path)}")
+                try:
+                    import pymupdf4llm
+                    
+                    # 1. Define Image Output Directory
+                    unique_id = uuid.uuid4().hex[:8]
+                    img_output_dir = Path(f"data/extracted_images/pdf_{unique_id}")
+                    img_output_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # 2. Convert to Markdown (Layout Preserved)
+                    # write_images=True extracts images to image_path
+                    md_text = pymupdf4llm.to_markdown(
+                        file_path, 
+                        write_images=True, 
+                        image_path=str(img_output_dir),
+                        image_format="jpg"
+                    )
+                    
+                    # 3. Analyze Extracted Images (Vision)
+                    image_descriptions = ""
+                    if img_output_dir.exists():
+                         print(f"      🖼️ Extracted images to {img_output_dir.name}. Analyzing...")
+                         for img_file in img_output_dir.glob("*.jpg"):
+                             # Filter small icons
+                             if img_file.stat().st_size < 3000: continue 
+                             
+                             try:
+                                 b64 = encode_image_from_file(str(img_file))
+                                 desc_path = Path("log") / (img_file.name + '_desc.txt')
+                                 desc = describe_image(b64, save_description_path=str(desc_path))
+                                 
+                                 # Rel path for markdown reference
+                                 rel_path = f"data/extracted_images/pdf_{unique_id}/{img_file.name}"
+                                 image_descriptions += f"\n[IMAGE PATH: {rel_path}]\n[ANALYSIS: {desc}]\n"
+                             except Exception as e:
+                                 print(f"      ⚠️ Image processing error: {e}")
 
-                        # Combine Text + Table Data
-                        final_content = text + "\n" + table_text
-                        
-                        # 3. Extract Images (Existing Logic)
-                        image_descriptions = ""
-                        for img in page.images:
-                            # Filter small icons (e.g. logos)
-                            if img['width'] < 100 or img['height'] < 100: continue
-                            
-                            try:
-                                # Get image bytes
-                                img_obj = page.crop( (img['x0'], img['top'], img['x1'], img['bottom']) ).to_image()
-                                if img_obj.original.mode not in ('RGB', 'L'):
-                                    img_obj.original = img_obj.original.convert('RGB')
-                                
-                                # Convert to bytes compatible with our util
-                                import io
-                                buf = io.BytesIO()
-                                img_obj.original.save(buf, format="JPEG")
-                                img_bytes = buf.getvalue()
-                                
-                                # --- SAVE LOCALLY ---
-                                img_filename = f"img_{uuid.uuid4().hex[:8]}.jpg"
-                                img_path = Path("data/extracted_images") / img_filename
-                                img_path.parent.mkdir(parents=True, exist_ok=True)
-                                img_obj.original.save(img_path, format="JPEG")
-                                
-                                # Describe
-                                print(f"      Possible Chart/Image on P{i+1}. Analyzing with Vision...")
-                                b64 = encode_image_from_bytes(img_bytes)
-                                
-                                # Save description to log directory
-                                log_dir = Path("log")
-                                if not log_dir.exists():
-                                    log_dir.mkdir(parents=True, exist_ok=True)
-                                desc_filename = img_path.stem + '_description.txt'
-                                desc_path = log_dir / desc_filename
-                                desc = describe_image(b64, save_description_path=str(desc_path))
-                                image_descriptions += f"\n[IMAGE PATH: {img_path}]\n{desc}"
-                            except Exception as e_img:
-                                print(f"      ⚠️ Image processing failed: {e_img}")
-
-                        # 3. Create Document
-                        full_content = text + "\n" + image_descriptions
-                        doc = Document(
-                            page_content=full_content,
-                            metadata={"source": os.path.basename(file_path), "page": i+1}
-                        )
-                        docs.append(doc)
+                    # 4. Construct Final Document
+                    final_content = md_text + "\n\n### EXTRACTED IMAGE ANALYSES:\n" + image_descriptions
+                    
+                    docs.append(Document(
+                        page_content=final_content,
+                        metadata={"source": os.path.basename(file_path)}
+                    ))
+                    
+                except ImportError:
+                    print("      ❌ Missing 'pymupdf4llm'. Install it first.")
+                except Exception as e:
+                    print(f"      ❌ PDF conversion failed: {e}")
                 
             elif ext == '.docx':
                 print(f"   - Loading DOCX (Multimodal): {os.path.basename(file_path)}")
@@ -532,7 +461,8 @@ def ingest_data():
         SET c.text = data.text, c.source = data.source, c.page = data.page, c.embedding = data.embedding
     """, {'batch': chunk_data_for_cypher})
     
-    create_indexes(graph)
+    create_vector_index(graph, dimensions=3072)
+    create_fulltext_index(graph)
 
     # --- 5. Extract Graph (LLM) ---
     print("\n🕸️ Extracting Graph Knowledge (with Chunk Combination)...")
