@@ -4,6 +4,7 @@ from PIL import Image
 from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from database import get_db_connection, create_fulltext_index
 
 # LCEL Imports
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
@@ -14,11 +15,7 @@ from langchain_core.output_parsers import StrOutputParser
 load_dotenv()
 
 # 2. Connect to Neo4j
-graph = Neo4jGraph(
-    url=os.getenv("NEO4J_URI"),
-    username=os.getenv("NEO4J_USERNAME"),
-    password=os.getenv("NEO4J_PASSWORD"),
-)
+graph = get_db_connection()
 
 # 3. Initialize Models
 # llm is now created dynamically in answer()
@@ -51,17 +48,7 @@ def initialize_reranker():
 # 4. Define Retrieval Function
 
 
-def create_fulltext_index(graph):
-    """Creates a fulltext index on Entity nodes for better keyword search."""
-    try:
-        # Check if index exists usually requires listing indexes, but we can try creating directly with IF NOT EXISTS logic handled by Neo4j or just try/except
-        graph.query("""
-            CREATE FULLTEXT INDEX entity_id_index IF NOT EXISTS 
-            FOR (n:Entity) ON EACH [n.id]
-        """)
-        print("✅ Fulltext Index 'entity_id_index' checks out.")
-    except Exception as e:
-        print(f"⚠️ Could not create fulltext index (might already exist): {e}")
+# create_fulltext_index is imported from database
 
 def extract_entities(llm, question: str) -> list:
     """Uses LLM to find the most important entities/keywords in the question."""

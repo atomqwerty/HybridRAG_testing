@@ -9,12 +9,14 @@ function App() {
     const [lightboxImage, setLightboxImage] = useState(null);
     const [isCreative, setIsCreative] = useState(true); // Default to Creative (0.3)
 
-    // Settings State
-    const [showSettings, setShowSettings] = useState(false);
-    const [config, setConfig] = useState({ strict_mode: true, rules: [], default_score: 0.5 }); // Default
-    const [newPattern, setNewPattern] = useState('');
-    const [newScore, setNewScore] = useState(1.0);
+    // View State ('chat' or 'settings')
+    const [view, setView] = useState('chat');
+    const [config, setConfig] = useState({ strict_mode: true, rules: [], default_score: 0.5 });
     const [availableFiles, setAvailableFiles] = useState([]);
+
+    // Ingestion State
+    const [currUrl, setCurrUrl] = useState('');
+    const [uploading, setUploading] = useState(false);
 
     const messagesEndRef = useRef(null);
 
@@ -31,7 +33,7 @@ function App() {
 
             setConfig(configData);
             setAvailableFiles(filesData.files || []);
-            setShowSettings(true);
+            setView('settings');
         } catch (err) {
             console.error("Failed to load settings", err);
         }
@@ -44,19 +46,11 @@ function App() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
             });
-            setShowSettings(false);
+            setView('chat');
             alert("Settings Saved!");
         } catch (err) {
             alert("Failed to save settings: " + err);
         }
-    };
-
-    const addRule = () => {
-        if (!newPattern.trim()) return;
-        const newRule = { pattern: newPattern, score: parseFloat(newScore), type: 'custom' };
-        setConfig({ ...config, rules: [...config.rules, newRule] });
-        setNewPattern('');
-        setNewScore(1.0);
     };
 
     const removeRule = async (idx) => {
@@ -66,7 +60,6 @@ function App() {
         }
 
         try {
-            // Optimistic update
             const newRules = config.rules.filter((_, i) => i !== idx);
             setConfig({ ...config, rules: newRules });
 
@@ -243,6 +236,70 @@ function App() {
         }
     };
 
+    // Ingestion Handlers
+    const handleAddUrl = async () => {
+        if (!currUrl) return;
+        setUploading(true);
+        try {
+            const res = await fetch('/api/ingest/url', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: currUrl })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                alert('Success: ' + data.message);
+                setCurrUrl('');
+            } else {
+                alert('Error: ' + data.error);
+            }
+        } catch (e) {
+            alert('Failed to add URL');
+        } finally {
+            setUploading(false);
+        }
+    };
+
+    const handleFileUpload = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const formData = new FormData();
+        formData.append('file', file);
+
+        setUploading(true);
+        try {
+            const res = await fetch('/api/ingest/upload', {
+                method: 'POST',
+                body: formData // No Content-Type header needed, browser adds it with boundary
+            });
+            const data = await res.json();
+            if (res.ok) {
+                alert('Success: ' + data.message);
+            } else {
+                alert('Error: ' + data.error);
+            }
+        } catch (e) {
+            alert('Failed to upload file');
+        } finally {
+            setUploading(false);
+            e.target.value = null; // Reset input
+        }
+    };
+
+    const clearDatabase = async () => {
+        if (!window.confirm("ARE YOU SURE? This will delete ALL ingested data (Nodes, Text, Images) from the database. This cannot be undone.")) return;
+
+        try {
+            const res = await fetch('/api/admin/clear_db', { method: 'POST' });
+            const data = await res.json();
+            if (res.ok) alert(data.message);
+            else alert("Error: " + data.error);
+        } catch (e) {
+            alert("Failed to clear database");
+        }
+    };
+
     const clearChat = async () => {
         try {
             await fetch('/api/clear', {
@@ -266,173 +323,193 @@ function App() {
 
     return (
         <div className="app-container">
-            <header className="app-header">
-                <div className="header-title">
-                    <h1>Hybrid RAG Assistant</h1>
-                </div>
-                <div className="header-controls">
-                    <button onClick={openSettings} className="icon-btn" title="Settings">⚙️</button>
-                    <button onClick={clearChat} className="icon-btn" title="Clear Chat">🗑️</button>
-                </div>
-            </header>
-
-            {showSettings && config && (
-                <div className="modal-overlay" onClick={() => setShowSettings(false)}>
-                    <div className="modal-content" onClick={e => e.stopPropagation()}>
-                        <h2>System Settings</h2>
-
-                        <div className="setting-group">
-                            <label className="checkbox-label">
-                                <input
-                                    type="checkbox"
-                                    checked={config.strict_mode}
-                                    onChange={(e) => setConfig({ ...config, strict_mode: e.target.checked })}
-                                />
-                                Strict Image Filtering Mode
-                            </label>
-                            <p className="setting-desc">
-                                Only show images that explicitly match keywords in the question.
-                            </p>
+            {view === 'settings' ? (
+                <div className="settings-page">
+                    <div className="settings-container-full">
+                        <div className="settings-header">
+                            <h2>⚙️ Settings & Data</h2>
+                            <button onClick={() => setView('chat')} className="btn-secondary">
+                                ← Back to Chat
+                            </button>
                         </div>
 
-                        <div className="setting-group">
-                            <label className="checkbox-label">
-                                <input
-                                    type="checkbox"
-                                    checked={isCreative}
-                                    onChange={(e) => setIsCreative(e.target.checked)}
-                                />
-                                Creative Mode (Temp 0.3)
-                            </label>
-                            <p className="setting-desc">
-                                Creative mode gives more natural answers. Uncheck for Precise Mode (0.0).
-                            </p>
-                        </div>
+                        <div className="settings-content">
+                            <div className="setting-group">
+                                <label className="checkbox-label">
+                                    <input
+                                        type="checkbox"
+                                        checked={isCreative}
+                                        onChange={(e) => setIsCreative(e.target.checked)}
+                                    />
+                                    Creative Mode (Temp 0.3)
+                                </label>
+                                <p className="setting-desc">
+                                    Creative mode gives more natural answers. Uncheck for Precise Mode (0.0).
+                                </p>
+                            </div>
 
-                        <h3>Trust Rules</h3>
-                        <div className="rules-table-container">
-                            <table className="rules-table">
-                                <thead>
-                                    <tr>
-                                        <th>Data Source Pattern</th>
-                                        <th>Trust Score</th>
-                                        <th>Action</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {config.rules.map((rule, idx) => (
-                                        <tr key={idx}>
-                                            <td>{rule.pattern}</td>
-                                            <td>
-                                                <input
-                                                    type="number"
-                                                    step="0.1" max="1.5" min="0"
-                                                    value={rule.score}
-                                                    onChange={(e) => updateRuleScore(idx, e.target.value)}
-                                                    className="score-input"
-                                                />
-                                            </td>
-                                            <td>
-                                                <button onClick={() => removeRule(idx)} className="btn-icon delete" title="Remove">×</button>
-                                            </td>
+                            <h3>Add Data Source</h3>
+                            <div className="ingest-section">
+                                <div className="ingest-row">
+                                    <input
+                                        type="text"
+                                        placeholder="Enter Website URL (e.g. https://example.com/spec)"
+                                        value={currUrl}
+                                        onChange={(e) => setCurrUrl(e.target.value)}
+                                        className="input-dark"
+                                    />
+                                    <button
+                                        onClick={handleAddUrl}
+                                        disabled={uploading}
+                                        className="btn-primary"
+                                    >
+                                        {uploading ? 'Processing...' : 'Crawl URL'}
+                                    </button>
+                                </div>
+
+                                <div className="ingest-row upload-row">
+                                    <span>Or upload file:</span>
+                                    <input
+                                        type="file"
+                                        onChange={handleFileUpload}
+                                        disabled={uploading}
+                                    />
+                                    {uploading && <span className="status-text">Ingesting...</span>}
+                                </div>
+                            </div>
+
+
+
+                            <h3>Trust Rules (View Only)</h3>
+                            <div className="rules-table-container">
+                                <table className="rules-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Data Source Pattern</th>
+                                            <th>Trust Score</th>
+                                            <th>Action</th>
                                         </tr>
-                                    ))}
-                                </tbody>
-                            </table>
+                                    </thead>
+                                    <tbody>
+                                        {config.rules.map((rule, idx) => (
+                                            <tr key={idx}>
+                                                <td>{rule.pattern}</td>
+                                                <td>
+                                                    <input
+                                                        type="number"
+                                                        step="0.1" max="1.5" min="0"
+                                                        value={rule.score}
+                                                        onChange={(e) => updateRuleScore(idx, e.target.value)}
+                                                        className="score-input"
+                                                    />
+                                                </td>
+                                                <td>
+                                                    <button onClick={() => removeRule(idx)} className="btn-icon delete" title="Remove">×</button>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <div className="danger-zone" style={{ marginTop: '40px', paddingTop: '20px', borderTop: '1px solid #e53e3e' }}>
+                                <h3 style={{ color: '#e53e3e', borderBottom: 'none' }}>⚠️ Danger Zone</h3>
+                                <button onClick={clearDatabase} style={{ background: '#e53e3e', color: 'white', border: 'none', padding: '10px 20px', borderRadius: '8px', cursor: 'pointer' }}>
+                                    Clear Database (Purge All Data)
+                                </button>
+                                <p style={{ color: '#a0aec0', fontSize: '0.9rem', marginTop: '10px' }}>
+                                    Use this if ingestion extracted too much "trash" and you want to start fresh with the new filters.
+                                </p>
+                            </div>
                         </div>
-
-
-
-
                         <div className="modal-actions">
-                            <button onClick={() => setShowSettings(false)} className="btn-secondary">Close</button>
+                            <button onClick={() => setView('chat')} className="btn-secondary">Close</button>
                             <button onClick={saveSettings} className="btn-primary">Save Changes</button>
                         </div>
                     </div>
                 </div>
-            )
-            }
-
-            <div className="chat-window">
-                <div className="chat-header">
-                    <div className="header-title">
-                        <h1>Hybrid RAG Assistant</h1>
+            ) : (
+                <div className="chat-window">
+                    <div className="chat-header">
+                        <div className="header-title">
+                            <h1>Hybrid RAG Assistant</h1>
+                        </div>
+                        <div className="header-controls">
+                            <button onClick={openSettings} className="icon-btn" title="Settings">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+                            </button>
+                            <button onClick={clearChat} className="icon-btn" title="Clear Chat">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+                            </button>
+                        </div>
                     </div>
-                    <div className="header-controls">
-                        <button onClick={openSettings} className="icon-btn" title="Settings">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-                        </button>
-                        <button onClick={clearChat} className="icon-btn" title="Clear Chat">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
-                        </button>
-                    </div>
-                </div>
 
-                <div className="messages-container">
-                    {messages.map((msg, idx) => (
-                        <div key={idx} className={`message ${msg.type}`}>
-                            <div className="message-content">
-                                {typeof msg.content === 'string' ? formatMessage(msg.content) : msg.content}
-                            </div>
-
-                            {msg.sources && msg.sources.length > 0 && (
-                                <div className="sources">
-                                    <strong>Sources:</strong>
-                                    <ul>
-                                        {msg.sources.map((src, i) => (
-                                            <li key={i}>{src.file} (Page {src.page})</li>
-                                        ))}
-                                    </ul>
+                    <div className="messages-container">
+                        {messages.map((msg, idx) => (
+                            <div key={idx} className={`message ${msg.type}`}>
+                                <div className="message-content">
+                                    {typeof msg.content === 'string' ? formatMessage(msg.content) : msg.content}
                                 </div>
-                            )}
 
-                            {msg.images && msg.images.length > 0 && (
-                                <div className="images">
-                                    <strong>Images:</strong>
-                                    <div className="image-grid">
-                                        {msg.images.map((img, i) => (
-                                            <div key={i} className="image-item">
-                                                <img
-                                                    src={`/images/${img}`}
-                                                    alt={`Reference ${i + 1}`}
-                                                    onClick={() => openLightbox(`/images/${img}`)}
-                                                />
-                                            </div>
-                                        ))}
+                                {msg.sources && msg.sources.length > 0 && (
+                                    <div className="sources">
+                                        <strong>Sources:</strong>
+                                        <ul>
+                                            {msg.sources.map((src, i) => (
+                                                <li key={i}>{src.file} (Page {src.page})</li>
+                                            ))}
+                                        </ul>
                                     </div>
-                                </div>
-                            )}
-                        </div>
-                    ))}
+                                )}
 
-                    {loading && (
-                        <div className="message bot loading">
-                            <div className="typing-indicator">
-                                <span></span>
-                                <span></span>
-                                <span></span>
+                                {msg.images && msg.images.length > 0 && (
+                                    <div className="images">
+                                        <strong>Images:</strong>
+                                        <div className="image-grid">
+                                            {msg.images.map((img, i) => (
+                                                <div key={i} className="image-item">
+                                                    <img
+                                                        src={`/images/${img}`}
+                                                        alt={`Reference ${i + 1}`}
+                                                        onClick={() => openLightbox(`/images/${img}`)}
+                                                    />
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
                             </div>
-                        </div>
-                    )}
+                        ))}
 
-                    <div ref={messagesEndRef} />
-                </div>
+                        {loading && (
+                            <div className="message bot loading">
+                                <div className="typing-indicator">
+                                    <span></span>
+                                    <span></span>
+                                    <span></span>
+                                </div>
+                            </div>
+                        )}
 
-                <form onSubmit={sendMessage} className="input-container">
-                    <div className="input-wrapper">
-                        <input
-                            type="text"
-                            value={input}
-                            onChange={(e) => setInput(e.target.value)}
-                            placeholder="Ask me anything..."
-                            disabled={loading}
-                        />
+                        <div ref={messagesEndRef} />
                     </div>
-                    <button type="submit" disabled={loading || !input.trim()}>
-                        ➜
-                    </button>
-                </form>
-            </div>
+
+                    <form onSubmit={sendMessage} className="input-container">
+                        <div className="input-wrapper">
+                            <input
+                                type="text"
+                                value={input}
+                                onChange={(e) => setInput(e.target.value)}
+                                placeholder="Ask me anything..."
+                                disabled={loading}
+                            />
+                        </div>
+                        <button type="submit" disabled={loading || !input.trim()}>
+                            ➜
+                        </button>
+                    </form>
+                </div>
+            )}
 
             {
                 lightboxImage && (

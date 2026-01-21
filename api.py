@@ -284,6 +284,99 @@ def list_files():
     except Exception as e:
         print(f"❌ Failed to list files: {e}")
         return jsonify({"error": str(e)}), 500
+# --- Ingestion Endpoints ---
+def run_ingestion_background():
+    """Runs data ingestion in a separate thread/process to avoid blocking."""
+    def _run():
+        print("🔄 Starting Ingestion Process...")
+        try:
+            # Run ingest_graph.py
+            # Using same python interpreter as current process
+            result = subprocess.run([sys.executable, "ingest_graph.py"], cwd=os.getcwd(), capture_output=True, text=True)
+            if result.returncode == 0:
+                print("✅ Ingestion Complete!")
+            else:
+                print(f"❌ Ingestion Failed: {result.stderr}")
+        except Exception as e:
+            print(f"❌ Ingestion Error: {e}")
+            
+    thread = threading.Thread(target=_run)
+    thread.start()
+
+@app.route('/api/ingest/url', methods=['POST'])
+def add_url_source():
+    """Adds a new URL to urls.txt and triggers ingestion."""
+    try:
+        data = request.json
+        url = data.get('url')
+        if not url:
+            return jsonify({"error": "URL is required"}), 400
+            
+        print(f"[INFO] Adding URL: {url}")
+        
+        # Append to urls.txt
+        url_file = "data/urls.txt"
+        with open(url_file, "a") as f:
+            f.write(f"\n{url}")
+            
+        # Trigger Ingestion
+        run_ingestion_background()
+        
+        return jsonify({"status": "success", "message": "URL added. Ingestion started in background."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/ingest/upload', methods=['POST'])
+def upload_file_source():
+    """Uploads a file to 'data/' and triggers ingestion."""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file part"}), 400
+            
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"error": "No selected file"}), 400
+            
+        if file:
+            filename = file.filename
+            # Sanitize filename if needed
+            save_path = os.path.join("data", filename)
+            file.save(save_path)
+            print(f"[INFO] File saved to: {save_path}")
+            
+            # Trigger Ingestion
+            run_ingestion_background()
+            
+            return jsonify({"status": "success", "message": f"File '{filename}' uploaded. Ingestion started."})
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/admin/clear_db', methods=['POST'])
+def clear_database():
+    """Wipes the entire Neo4j database AND extracted images/logs."""
+    try:
+        print("⚠️ CLEARING DATABASE & ARTIFACTS...")
+        
+        # 1. Clear Graph
+        graph.query("MATCH (n) DETACH DELETE n")
+        
+        # 2. Clear Extracted Images
+        img_dir = "data/extracted_images"
+        if os.path.exists(img_dir):
+            import shutil
+            shutil.rmtree(img_dir)
+            os.makedirs(img_dir, exist_ok=True)
+            
+        # 3. Clear Logs
+        log_dir = "log"
+        if os.path.exists(log_dir):
+            shutil.rmtree(log_dir)
+            os.makedirs(log_dir, exist_ok=True)
+
+        return jsonify({"status": "success", "message": "Database, Images, and Logs cleared. You can now re-ingest."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 # ------------------------------
 
 if __name__ == '__main__':

@@ -17,6 +17,7 @@ from langchain_experimental.text_splitter import SemanticChunker
 from langchain_core.documents import Document
 import pdfplumber
 from vision_utils import describe_image, encode_image_from_bytes, encode_image_from_file
+from crawler import get_internal_links, get_links_from_sitemap, load_web_with_images, clean_extracted_images
 
 # Load environment variables
 load_dotenv()
@@ -152,305 +153,17 @@ def get_combined_chunks(docs, chunks_to_combine=3):
     
     return combined
 
-def get_internal_links(base_url, max_links=200):
-    """
-    Recursively crawls up to 2 levels deep to find car model pages.
-    """
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
-    from urllib.parse import urljoin, urlparse
-    import time
-
-    print(f"   🕷️ Deep Crawling (2 Levels) starting at: {base_url}")
-    
-    # Setup Headless Chrome
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--window-size=1920,1080")
-    
-    found_links = set([base_url])
-    queue = [(base_url, 0)] # URL, Depth
-    visited = set()
-    
+def get_existing_sources(graph):
+    """Retrieves a set of source identifiers (filenames/URLs) already in the database."""
     try:
-        from selenium.webdriver.chrome.service import Service as ChromeService
-        from selenium.webdriver.chrome.options import Options
-        
-        # Access system-installed chromedriver directly
-        service = ChromeService(executable_path="/usr/bin/chromedriver")
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+        # Check Chunk sources (most reliable indicator of ingestion)
+        data = graph.query("MATCH (c:Chunk) RETURN DISTINCT c.source AS source")
+        return set(record['source'] for record in data)
     except Exception as e:
-        print(f"⚠️ Selenium/Webdriver failed: {e}. Skipping web crawling.")
+        print(f"   ⚠️ Could not fetch existing sources: {e}")
         return set()
-        
-        while queue and len(found_links) < max_links:
-            current_url, depth = queue.pop(0)
-            
-            if current_url in visited or depth >= 3:
-                continue
-            
-            visited.add(current_url)
-            print(f"      Scanning (Level {depth}): {current_url}")
-            
-            try:
-                driver.get(current_url)
-                time.sleep(3) # Wait for render (Increased for safety)
-                
-                domain = urlparse(base_url).netloc
-                elements = driver.find_elements("tag name", "a")
-                
-                for elem in elements:
-                    try:
-                        href = elem.get_attribute("href")
-                        if not href: continue
-                        
-                        full_url = urljoin(base_url, href)
-                        parsed = urlparse(full_url)
-                        
-                        # Normalize domain (ignore www.)
-                        base_domain = domain.replace("www.", "")
-                        link_domain = parsed.netloc.replace("www.", "")
-                        
-                        if base_domain not in link_domain: 
-                            # print(f"      - Ignored (External): {full_url}")
-                            continue
-                        
-                        # Filter noise
-                        path = parsed.path.lower()
-                        noise = ['about', 'contact', 'cart', 'login', 'facebook', 'line', 'tel:', 'mailto:', 'javascript', 'product', 'review', 'blog']
-                        if any(x in path or x in full_url.lower() for x in noise): continue
-                        
-                        # We now accept ALL links from this domain unless they are explicit noise.
-                        if full_url not in found_links:
-                            found_links.add(full_url)
-                            print(f"      + Queued: {full_url}")
-                            
-                            # Heuristic Priority: Product-like pages go first
-                            priority = 0
-                            if any(x in path for x in ['html', 'product', 'item', 'detail', 'spec', 'model']):
-                                priority = 1
-                            
-                            if priority > 0:
-                                queue.insert(0, (full_url, depth + 1))
-                            else:
-                                queue.append((full_url, depth + 1))
-                                
-                    except Exception:
-                        continue
-                         
-            except Exception as e:
-                print(f"      ⚠️ Failed to crawl {current_url}: {e}")
-                
-        driver.quit()
-        
-    except Exception as e:
-        print(f"   ⚠️ Crawler failed: {e}")
-        
-    print(f"   ✅ Found {len(found_links)} total pages to scrape.")
-    return list(found_links)
 
-def clean_extracted_images():
-    """Cleans up old extracted images and logs before fresh ingestion."""
-    import shutil
-    
-    print("🧹 Cleaning up old extracted images and logs...")
-    
-    # Clean Images
-    img_dir = Path("data/extracted_images")
-    if img_dir.exists():
-        try:
-            shutil.rmtree(img_dir)
-            img_dir.mkdir(exist_ok=True)
-            print("   ✅ Deleted old data/extracted_images/")
-        except Exception as e:
-            print(f"   ⚠️ Could not clean image dir: {e}")
-            
-    # Clean Logs (Optional, but good for debugging)
-    log_dir = Path("log")
-    if log_dir.exists():
-         try:
-            shutil.rmtree(log_dir)
-            log_dir.mkdir(exist_ok=True)
-            print("   ✅ Deleted old log/")
-         except Exception as e:
-             print(f"   ⚠️ Could not clean log dir: {e}")
-
-def load_web_with_images(url):
-    """
-    Uses Selenium (RPA) to render the page, scroll for lazy loading,
-    and extract high-fidelity text and images.
-    """
-    from bs4 import BeautifulSoup
-    import requests # Keep requests for image downloading only
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
-    from urllib.parse import urljoin
-    import time
-    
-    print(f"   - Scraping (RPA/Selenium): {url}")
-    
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--window-size=1920,1080")
-    
-    try:
-        # Access system-installed chromedriver directly
-        service = Service(executable_path="/usr/bin/chromedriver")
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        
-        try:
-            driver.get(url)
-            
-            # --- RPA Action: Scroll to Bottom to trigger Lazy Loading ---
-            print("      ↓ Auto-scrolling to trigger lazy content...")
-            last_height = driver.execute_script("return document.body.scrollHeight")
-            while True:
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2) # Wait for page to load
-                new_height = driver.execute_script("return document.body.scrollHeight")
-                if new_height == last_height:
-                    break
-                last_height = new_height
-            # -------------------------------------------------------------
-            
-            # Get fully rendered HTML
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            
-        finally:
-            driver.quit()
-        
-        # 1. Extract Images (from the rendered Soup)
-        images = soup.find_all('img')
-        image_descriptions = ""
-        
-        # --- SMART SELECTION STRATEGY ---
-        # 1. Collect potential candidates
-        candidates = []
-        for img in images:
-            src = img.get('src') or img.get('data-src')
-            if not src: continue
-            if src.startswith("data:image"): continue
-            
-            full_url = urljoin(url, src)
-            
-            # Filter noise keywords in URL
-            if any(x in full_url.lower() for x in ['logo', 'icon', 'button', 'social', 'footer']): 
-                continue
-                
-            candidates.append(full_url)
-
-        # 2. Download and Filter by Size (Get the "Meatier" content)
-        valid_images = [] # List of (size_in_bytes, local_path, source_url)
-        MAX_CANDIDATES_CHECK = 100 # INCREASED: Check more images
-        
-        print(f"      🔎 Scanning {len(candidates)} images to find the most important ones...")
-        
-        for full_url in list(set(candidates))[:MAX_CANDIDATES_CHECK]:
-            try:
-                img_resp = requests.get(full_url, stream=True, timeout=3)
-                if img_resp.status_code != 200: continue
-                
-                size = len(img_resp.content)
-                if size < 2000: continue # LOWERED THRESHOLD: 2KB (Catch smaller logos/specs)
-                
-                # Save locally temporarily
-                suffix = Path(full_url).suffix
-                if not suffix or suffix.lower() not in ['.jpg', '.png', '.jpeg', '.webp']:
-                    suffix = '.jpg'
-                    
-                img_filename = f"web_{uuid.uuid4().hex[:8]}{suffix}"
-                save_dir = Path("data/extracted_images")
-                save_dir.mkdir(parents=True, exist_ok=True)
-                img_path = save_dir / img_filename
-                
-                with open(img_path, "wb") as f:
-                    f.write(img_resp.content)
-                    
-                # Skip SVGs
-                if img_path.suffix.lower() == '.svg': 
-                    continue
-                    
-                valid_images.append((size, img_path, full_url))
-                
-            except:
-                continue
-        
-        # 3. Sort by Size (Descending) -> Largest images differ likely to be Main Content/Diagrams
-        valid_images.sort(key=lambda x: x[0], reverse=True)
-        
-        # 4. Select Top 5
-        top_images = valid_images[:5]
-        print(f"      🏆 Selected top {len(top_images)} largest images for analysis.")
-
-        # 5. Analyze with Vision
-        for _, img_path, full_url in top_images:
-            try:
-                print(f"      📸 Analyzed Web Image: {os.path.basename(full_url)[:30]}...")
-                b64 = encode_image_from_file(str(img_path))
-                
-                # Save description
-                log_dir = Path("log")
-                log_dir.mkdir(parents=True, exist_ok=True)
-                desc_path = log_dir / (img_path.stem + '_description.txt')
-                
-                desc = describe_image(b64, save_description_path=str(desc_path))
-                # Store path relative to project root for frontend serving
-                rel_img_path = str(img_path).replace("\\", "/") # Ensure forward slashes
-                image_descriptions += f"\n[IMAGE PATH: {rel_img_path}]\n[SOURCE URL: {full_url}]\n{desc}\n"
-                
-            except Exception as e:
-                print(f"      ⚠️ Vision analysis failed: {e}")
-                
-        # 2. Extract Text
-        # Remove scripts and styles
-        for script in soup(["script", "style", "noscript"]):
-            script.decompose()
-            
-        text = soup.get_text(separator='\n')
-        
-        # Clean up whitespace
-        lines = (line.strip() for line in text.splitlines())
-        clean_text = '\n'.join(line for line in lines if line)
-        
-        # Combine
-        full_content = f"Source URL: {url}\n\n{clean_text}\n\n### DETECTED IMAGES FROM WEBPAGE:\n{image_descriptions}"
-        
-        # FINAL CLEAN: Remove Markdown Bolding (User Request)
-        full_content = full_content.replace("**", "").replace("__", "")
-        
-        # --- Log Scraped Content ---
-        try:
-            log_dir = Path("log")
-            log_dir.mkdir(parents=True, exist_ok=True)
-            # Create simple filename
-            sanitized_name = url.replace("https://", "").replace("http://", "").replace("/", "_").replace(":", "")[:50]
-            log_file = log_dir / f"web_scraped_{sanitized_name}_{uuid.uuid4().hex[:6]}.txt"
-            
-            with open(log_file, "w", encoding="utf-8") as f:
-                f.write(full_content)
-            print(f"      📝 Scraped content saved to: {log_file}")
-        except Exception as e:
-            print(f"      ⚠️ Failed to save web log: {e}")
-        # ---------------------------
-        
-        return [Document(
-            page_content=full_content,
-            metadata={"source": url, "title": soup.title.string if soup.title else url}
-        )]
-        
-    except Exception as e:
-        print(f"      ❌ Web Scraping (Selenium) failed for {url}: {e}")
-        return []
+# Web crawling and scraping functions have been moved to crawler.py
 
 def ingest_data():
     start_time = time.time()
@@ -466,9 +179,9 @@ def ingest_data():
         print("✅ Connected to Neo4j")
         
         # Clear existing data for a fresh start with PDFPlumber
-        print("🧹 Clearing existing database to ensure clean table ingestion...")
-        graph.query("MATCH (n) DETACH DELETE n")
-        print("   ✅ Database cleared.")
+        # print("🧹 Clearing existing database to ensure clean table ingestion...")
+        # graph.query("MATCH (n) DETACH DELETE n")
+        # print("   ✅ Database cleared.")
         
     except Exception as e:
         print(f"❌ Failed to connect to Neo4j: {e}")
@@ -497,14 +210,19 @@ def ingest_data():
     start_time = time.time()
     
     # CLEANUP OLD DATA FIRST
-    clean_extracted_images()
+    # clean_extracted_images() # DISABLED for incremental update
     
     docs = []
-    
+    existing_sources = get_existing_sources(graph)
+    print(f"   ℹ️  Found {len(existing_sources)} existing documents in DB. Skipping them.")
+
     # Process local files
     print("\n📂 Loading local files from data/ ...")
     
     for file_path in all_files:
+        if os.path.basename(file_path) in existing_sources:
+             print(f"   ⏩ Skipping existing file: {os.path.basename(file_path)}")
+             continue
         ext = os.path.splitext(file_path)[1].lower()
         
         try:
@@ -697,15 +415,29 @@ def ingest_data():
             print(f"   - Found {len(urls)} root URLs.")
             all_urls_to_process = set()
             
-            # 1. Expand URLs (Crawl 1 level deep)
+            # 1. Expand URLs (SItemap First -> Crawl Fallback)
             for root_url in urls:
-                sub_links = get_internal_links(root_url, max_links=10) # Crawl sub-pages
-                all_urls_to_process.update(sub_links)
+                print(f"   🔎 Discovering content for: {root_url}")
+                
+                # Check Sitemap
+                sitemap_links = get_links_from_sitemap(root_url)
+                
+                if sitemap_links:
+                     print(f"      🚀 Using {len(sitemap_links)} URLs from Sitemap (skipping crawler).")
+                     all_urls_to_process.update(sitemap_links)
+                else:
+                     # Fallback to Crawl (Deep Curl)
+                     print(f"      🕸️ No sitemap found. Falling back to deep crawler...")
+                     sub_links = get_internal_links(root_url, max_links=100) 
+                     all_urls_to_process.update(sub_links)
             
             print(f"   - Processing {len(all_urls_to_process)} total pages (Root + Sub-pages)...")
             
             # 2. Scrape Each
             for url in all_urls_to_process:
+                if url in existing_sources:
+                     print(f"   ⏩ Skipping existing URL: {url}")
+                     continue
                 try:
                     web_docs = load_web_with_images(url)
                     docs.extend(web_docs)
