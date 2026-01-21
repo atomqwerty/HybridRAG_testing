@@ -9,6 +9,8 @@ langchain-openai
 openai
 pillow
 pypdf
+selenium
+webdriver-manager
 requests
 beautifulsoup4
 pdfplumber
@@ -16,3 +18,5 @@ langchain-experimental
 docx2txt
 sentence-transformers
 tiktoken
+langchain-text-splitters
+langchain-neo4j

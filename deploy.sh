@@ -9,11 +9,15 @@ if [ ! -f .env ]; then
 fi
 
 # Load .env vars for usage in this script if needed
-export $(cat .env | xargs)
+# Note: docker-compose reads .env automatically, so we don't strictly need to export them here 
+# unless we use them inside THIS script (e.g. echo $VAR).
+if [ -f .env ]; then
+  export $(grep -v '^#' .env | xargs)
+fi
 
 echo "📦 Building and Starting Containers..."
-docker-compose up -d --build
+sudo docker compose up -d --build
 
 echo "✅ Deployment Complete!"
-echo "🌍 App is running at: http://localhost:8000"
+echo "🌍 App is running at: http://localhost:8080"
 echo "📊 Neo4j is running at: http://localhost:7474"

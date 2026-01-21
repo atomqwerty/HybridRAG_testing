@@ -22,8 +22,8 @@ function App() {
     const openSettings = async () => {
         try {
             const [configRes, filesRes] = await Promise.all([
-                fetch('http://localhost:8000/api/config/trust'),
-                fetch('http://localhost:8000/api/files')
+                fetch('/api/config/trust'),
+                fetch('/api/files')
             ]);
 
             const configData = await configRes.json();
@@ -39,7 +39,7 @@ function App() {
 
     const saveSettings = async () => {
         try {
-            await fetch('http://localhost:8000/api/config/trust', {
+            await fetch('/api/config/trust', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
@@ -70,7 +70,7 @@ function App() {
             const newRules = config.rules.filter((_, i) => i !== idx);
             setConfig({ ...config, rules: newRules });
 
-            const res = await fetch('http://localhost:8000/api/source', {
+            const res = await fetch('/api/source', {
                 method: 'DELETE',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ pattern: ruleToRemove.pattern })
@@ -208,7 +208,7 @@ function App() {
         try {
             // Use relative path for production (handled by proxy in dev)
             // Use absolute URL to force connection to backend
-            const response = await fetch('http://localhost:8000/api/chat', {
+            const response = await fetch('/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -245,7 +245,7 @@ function App() {
 
     const clearChat = async () => {
         try {
-            await fetch('http://localhost:8000/api/clear', {
+            await fetch('/api/clear', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ session_id: sessionId })
@@ -393,9 +393,9 @@ function App() {
                                         {msg.images.map((img, i) => (
                                             <div key={i} className="image-item">
                                                 <img
-                                                    src={`http://localhost:8000/images/${img}`}
+                                                    src={`/images/${img}`}
                                                     alt={`Reference ${i + 1}`}
-                                                    onClick={() => openLightbox(`http://localhost:8000/images/${img}`)}
+                                                    onClick={() => openLightbox(`/images/${img}`)}
                                                 />
                                             </div>
                                         ))}

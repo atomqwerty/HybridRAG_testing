@@ -170,6 +170,7 @@ def get_internal_links(base_url, max_links=200):
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
     
     found_links = set([base_url])
@@ -177,8 +178,15 @@ def get_internal_links(base_url, max_links=200):
     visited = set()
     
     try:
-        service = Service(ChromeDriverManager().install())
+        from selenium.webdriver.chrome.service import Service as ChromeService
+        from selenium.webdriver.chrome.options import Options
+        
+        # Access system-installed chromedriver directly
+        service = ChromeService(executable_path="/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=chrome_options)
+    except Exception as e:
+        print(f"⚠️ Selenium/Webdriver failed: {e}. Skipping web crawling.")
+        return set()
         
         while queue and len(found_links) < max_links:
             current_url, depth = queue.pop(0)
@@ -204,37 +212,36 @@ def get_internal_links(base_url, max_links=200):
                         full_url = urljoin(base_url, href)
                         parsed = urlparse(full_url)
                         
-                        # Domain check
-                        if parsed.netloc != domain: continue
+                        # Normalize domain (ignore www.)
+                        base_domain = domain.replace("www.", "")
+                        link_domain = parsed.netloc.replace("www.", "")
+                        
+                        if base_domain not in link_domain: 
+                            # print(f"      - Ignored (External): {full_url}")
+                            continue
                         
                         # Filter noise
                         path = parsed.path.lower()
-                        noise = ['about', 'contact', 'cart', 'login', 'facebook', 'line', 'tel:', 'mailto:', 'javascript']
+                        noise = ['about', 'contact', 'cart', 'login', 'facebook', 'line', 'tel:', 'mailto:', 'javascript', 'product', 'review', 'blog']
                         if any(x in path or x in full_url.lower() for x in noise): continue
                         
-                        # Only add if it looks relevant (EV/Charger/Car)
-                        is_relevant = any(k in full_url.lower() for k in ['ev', 'charger', 'car', 'model', 'spec', 'audi', 'benz', 'bmw', 'mg', 'volvo'])
-                        if not is_relevant and depth > 0: continue
-                        
+                        # We now accept ALL links from this domain unless they are explicit noise.
                         if full_url not in found_links:
                             found_links.add(full_url)
-                            # If it's a category/hub page, queue it for next level
-                            # We assume pages with 'ev-charging' might have sub-models
-                            if 'html' in path and depth < 2:
-                                priority_score = 0
-                                if any(x in path for x in ['2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025']):
-                                    priority_score = 2 # High priority (Specific Model Year)
-                                elif any(x in path for x in ['spec', 'model']):
-                                    priority_score = 1 # Medium priority
-                                
-                                # Insert based on priority (Pseudo-Priority Queue)
-                                if priority_score > 0:
-                                    queue.insert(0, (full_url, depth + 1))
-                                else:
-                                    queue.append((full_url, depth + 1))
+                            print(f"      + Queued: {full_url}")
+                            
+                            # Heuristic Priority: Product-like pages go first
+                            priority = 0
+                            if any(x in path for x in ['html', 'product', 'item', 'detail', 'spec', 'model']):
+                                priority = 1
+                            
+                            if priority > 0:
+                                queue.insert(0, (full_url, depth + 1))
+                            else:
+                                queue.append((full_url, depth + 1))
                                 
                     except Exception:
-                         continue
+                        continue
                          
             except Exception as e:
                 print(f"      ⚠️ Failed to crawl {current_url}: {e}")
@@ -293,10 +300,12 @@ def load_web_with_images(url):
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
     
     try:
-        service = Service(ChromeDriverManager().install())
+        # Access system-installed chromedriver directly
+        service = Service(executable_path="/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=chrome_options)
         
         try:
@@ -342,7 +351,7 @@ def load_web_with_images(url):
 
         # 2. Download and Filter by Size (Get the "Meatier" content)
         valid_images = [] # List of (size_in_bytes, local_path, source_url)
-        MAX_CANDIDATES_CHECK = 20 # Check up to 20 images to find the best ones
+        MAX_CANDIDATES_CHECK = 100 # INCREASED: Check more images
         
         print(f"      🔎 Scanning {len(candidates)} images to find the most important ones...")
         
@@ -352,7 +361,7 @@ def load_web_with_images(url):
                 if img_resp.status_code != 200: continue
                 
                 size = len(img_resp.content)
-                if size < 8000: continue # Skip small images (< 8KB) - likely spacers/icons
+                if size < 2000: continue # LOWERED THRESHOLD: 2KB (Catch smaller logos/specs)
                 
                 # Save locally temporarily
                 suffix = Path(full_url).suffix
@@ -395,7 +404,9 @@ def load_web_with_images(url):
                 desc_path = log_dir / (img_path.stem + '_description.txt')
                 
                 desc = describe_image(b64, save_description_path=str(desc_path))
-                image_descriptions += f"\n[IMAGE PATH: {img_path}]\n[SOURCE URL: {full_url}]\n{desc}\n"
+                # Store path relative to project root for frontend serving
+                rel_img_path = str(img_path).replace("\\", "/") # Ensure forward slashes
+                image_descriptions += f"\n[IMAGE PATH: {rel_img_path}]\n[SOURCE URL: {full_url}]\n{desc}\n"
                 
             except Exception as e:
                 print(f"      ⚠️ Vision analysis failed: {e}")
