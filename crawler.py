@@ -14,6 +14,7 @@ from selenium.webdriver.chrome.service import Service
 import json
 from langchain_core.documents import Document
 from vision_utils import describe_image, encode_image_from_file
+from config import Config
 
 # --- CONFIG LOADER ---
 DEFAULTS = {
@@ -74,7 +75,7 @@ def get_internal_links(base_url, max_links=200):
     print(f"   🕷️ Deep Crawling (3 Levels) starting at: {base_url} (Using Requests/Curl)")
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": Config.USER_AGENT
     }
     
     found_links = set([base_url])
@@ -261,6 +262,7 @@ def load_web_with_images(url):
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument(f"user-agent={Config.USER_AGENT}")
     
     try:
         # Access system-installed chromedriver directly

@@ -243,6 +243,28 @@ def delete_source_data():
         q1 = "MATCH (n:Chunk) WHERE n.source CONTAINS $pattern DETACH DELETE n"
         graph.query(q1, {"pattern": pattern})
         
+        # 3. Delete Physical File (if exists)
+        file_path = os.path.join(Config.DATA_DIR, pattern)
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+            try:
+                os.remove(file_path)
+                logger.info(f"Deleted file: {file_path}")
+            except Exception as e:
+                logger.error(f"Failed to delete file {file_path}: {e}")
+
+        # 4. Remove from urls.txt (if it's a domain/url pattern)
+        url_file = os.path.join(Config.DATA_DIR, "urls.txt")
+        if os.path.exists(url_file):
+            try:
+                with open(url_file, "r") as f:
+                    lines = f.readlines()
+                with open(url_file, "w") as f:
+                    for line in lines:
+                        # Check if pattern is in the URL (weak match, but safe for domains)
+                        if pattern not in line:
+                            f.write(line)
+            except: pass
+
         # Update config
         if os.path.exists(Config.TRUST_CONFIG_FILE):
             with open(Config.TRUST_CONFIG_FILE, "r") as f:
@@ -275,6 +297,13 @@ def list_files():
 
 # --- Ingestion Endpoints ---
 def run_ingestion_background():
+    
+    # Reset status synchronously to prevent UI race conditions
+    try:
+        with open(os.path.join(Config.DATA_DIR, "ingest_status.json"), "w") as f:
+            json.dump({"percent": 0, "message": "Starting...", "status": "running"}, f)
+    except: pass
+
     def _run():
         logger.info("Starting Ingestion Process...")
         try:

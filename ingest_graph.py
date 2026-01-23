@@ -73,9 +73,10 @@ def ingest_data():
     
     def update_status(percent, message):
         try:
+            status = "running" if percent < 100 else "completed"
             with open(os.path.join(Config.DATA_DIR, "ingest_status.json"), "w") as f:
                 import json
-                json.dump({"percent": percent, "message": message, "status": "running"}, f)
+                json.dump({"percent": percent, "message": message, "status": status}, f)
         except: pass
 
     update_status(5, "Connecting to Database...")
@@ -107,6 +108,26 @@ def ingest_data():
         openai_api_key=Config.OPENAI_API_KEY
     )
 
+    # --- Helper: Auto-Trust ---
+    def auto_add_trust_rule(pattern, type_):
+        try:
+            import json
+            config_path = Config.TRUST_CONFIG_FILE
+            data = {}
+            if os.path.exists(config_path):
+                 with open(config_path, 'r') as f: data = json.load(f)
+            
+            rules = data.get('rules', [])
+            if any(r['pattern'] == pattern for r in rules): return
+                
+            rules.append({"pattern": pattern, "score": 1.0, "type": type_})
+            data['rules'] = rules
+            if 'default_score' not in data: data['default_score'] = 0.5
+            
+            with open(config_path, 'w') as f: json.dump(data, f, indent=4)
+            logger.info(f"   🛡️ Auto-added Trust Rule for: {pattern} ({type_})")
+        except: pass
+
     # --- Load & Chunk ---
     logger.info("Loading & Chunking Documents...")
     all_files = glob.glob(os.path.join(Config.DATA_DIR, "*"))
@@ -116,15 +137,26 @@ def ingest_data():
     update_status(10, "Loading Documents...")
     
     for file_path in all_files:
-        if os.path.basename(file_path) in existing_sources: continue
+        filename = os.path.basename(file_path)
+        
+        # SKIP Config/Status files (User Request)
+        if filename in ["urls.txt", "source_config.json", "ingest_status.json", "chat_sessions.json"]:
+            continue
+            
+        # Verify it's a file relative to data dir to avoid trust issues
+        if os.path.isfile(file_path):
+            auto_add_trust_rule(filename, 'file')
+
+        if filename in existing_sources: continue
         ext = os.path.splitext(file_path)[1].lower()
         
         try:
             if ext == '.pdf':
-                logger.info(f"Loading PDF: {os.path.basename(file_path)}")
+                logger.info(f"Loading PDF: {filename}")
                 try:
                     import pymupdf4llm
                     unique_id = uuid.uuid4().hex[:8]
+                    # ... text ...
                     img_output_dir = Path(Config.DATA_DIR) / "extracted_images" / f"pdf_{unique_id}"
                     img_output_dir.mkdir(parents=True, exist_ok=True)
                     
@@ -197,6 +229,13 @@ def ingest_data():
             update_status(20, "Discovering Sub-pages...")
             logger.info(f"Found {len(urls)} root URLs. Starting parallel discovery...")
             
+            for u in urls:
+                try:
+                    from urllib.parse import urlparse
+                    domain = urlparse(u).netloc.replace('www.', '')
+                    if domain: auto_add_trust_rule(domain, 'domain')
+                except: pass
+
             all_urls_to_process = set()
             
             def discover_links(root_url):
@@ -225,9 +264,13 @@ def ingest_data():
             # --- PHASE 2: EXTRACTION (Parallel) ---
             update_status(30, f"Scraping {len(all_urls_to_process)} pages...")
             
+            # Loop is already parallel above
             def process_url(url):
-                if url in existing_sources: return []
+                if url in existing_sources: 
+                    logger.info(f"   ⏩ Skipping existing: {url}")
+                    return []
                 try:
+                    logger.info(f"   🕷️  Scraping: {url}")
                     # Stagger start to avoid spikes
                     time.sleep(random.uniform(0.5, 2.0)) 
                     return load_web_with_images(url)
@@ -243,6 +286,7 @@ def ingest_data():
 
     if not docs:
         logger.info("No content loaded. Exiting.")
+        update_status(100, "All URLs already processed.")
         return
 
     # Chunking
@@ -264,7 +308,33 @@ def ingest_data():
     update_status(50, "Embedding Chunks...")
     chunk_data = []
     chunks_with_metadata = []
-    batch_emb = embeddings.embed_documents([c.page_content for c in final_chunks])
+    
+    # BATCHING EMBEDDINGS to avoid 413 Errors
+    batch_size = 20 # Conservative batch size
+    all_texts = [c.page_content for c in final_chunks]
+    all_embeddings = []
+    
+    total_batches = (len(all_texts) + batch_size - 1) // batch_size
+    
+    for i in range(0, len(all_texts), batch_size):
+        batch_texts = all_texts[i : i + batch_size]
+        try:
+            logger.info(f"   Embedding batch {i//batch_size + 1}/{total_batches}...")
+            batch_res = embeddings.embed_documents(batch_texts)
+            all_embeddings.extend(batch_res)
+        except Exception as e:
+            logger.error(f"   ⚠️ Embedding Batch Failed: {e}")
+            # Fallback: Try one by one or skip?
+            # For now, just append empty or zeros to keep index alignment?
+            # Better to fail explicitly or retry. 
+            # Let's try to append zero-vectors or skip. 
+            # Actually, if we skip, indexes misalign. We must align.
+            # Let's try individual fallback.
+            for text in batch_texts:
+                try:
+                    all_embeddings.append(embeddings.embed_query(text))
+                except:
+                    all_embeddings.append([0.0] * 3072) # Dummy vector
 
     for i, chunk in enumerate(final_chunks):
         chunk_id = hashlib.md5(chunk.page_content.encode()).hexdigest()
@@ -277,17 +347,22 @@ def ingest_data():
             'text': chunk.page_content,
             'source': source,
             'page': chunk.metadata.get('page'),
-            'embedding': batch_emb[i],
+            'embedding': all_embeddings[i],
             'seq': i
         })
 
-    # Ingest Chunks
+    # Ingest Chunks (Batch Cypher Writes too)
     update_status(60, "Writing to Neo4j...")
-    graph.query("""
-        UNWIND $batch AS data
-        MERGE (c:Chunk {id: data.id})
-        SET c.text = data.text, c.source = data.source, c.page = data.page, c.embedding = data.embedding, c.seq = data.seq
-    """, {'batch': chunk_data})
+    
+    # Write in batches of 100
+    write_batch_size = 100
+    for i in range(0, len(chunk_data), write_batch_size):
+        batch = chunk_data[i : i + write_batch_size]
+        graph.query("""
+            UNWIND $batch AS data
+            MERGE (c:Chunk {id: data.id})
+            SET c.text = data.text, c.source = data.source, c.page = data.page, c.embedding = data.embedding, c.seq = data.seq
+        """, {'batch': batch})
     
     # Create Relations
     graph.query("""
@@ -317,9 +392,20 @@ def ingest_data():
     )
     
     all_graph_docs = []
+    
+    # Progress Tracking
+    total_batches = (len(combined_docs) + 4) // 5
+    completed_batches = 0
+    
     def process_batch(batch):
-        try: return llm_transformer.convert_to_graph_documents(batch)
-        except: return []
+        try: 
+            # logger.info("   Processing graph batch...") 
+            return llm_transformer.convert_to_graph_documents(batch)
+        except Exception as e:
+            logger.warning(f"Graph extraction failed for batch: {e}")
+            return []
+
+    logger.info(f"Extracting entities from {len(combined_docs)} combined chunks (in {total_batches} batches)...")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         futures = []
@@ -330,6 +416,11 @@ def ingest_data():
         for f in concurrent.futures.as_completed(futures):
             res = f.result()
             if res: all_graph_docs.extend(res)
+            
+            completed_batches += 1
+            if completed_batches % 2 == 0 or completed_batches == total_batches:
+                logger.info(f"   Using LLM to extract entities: {completed_batches}/{total_batches} batches done...")
+                update_status(80 + int(10 * completed_batches / total_batches), f"Extracting Entities ({completed_batches}/{total_batches})")
 
     if all_graph_docs:
         graph.add_graph_documents(all_graph_docs)

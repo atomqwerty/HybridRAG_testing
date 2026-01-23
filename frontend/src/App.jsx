@@ -20,13 +20,16 @@ function App() {
     const [ingestStatus, setIngestStatus] = useState({ percent: 0, message: '' });
 
     const messagesEndRef = useRef(null);
+    const viewRef = useRef(view);
+
+    useEffect(() => { viewRef.current = view; }, [view]);
 
     // Fetch Config on open settings
     const openSettings = async () => {
         try {
             const [configRes, filesRes] = await Promise.all([
-                fetch('/api/config/trust'),
-                fetch('/api/files')
+                fetch('/api/config/trust?_t=' + Date.now()),
+                fetch('/api/files?_t=' + Date.now())
             ]);
 
             const configData = await configRes.json();
@@ -122,7 +125,27 @@ function App() {
                     if (data.percent >= 100) {
                         setIsIngesting(false);
                         setUploading(false); // Ensure button enables
-                        alert("✅ " + (data.message || "Ingestion Complete!"));
+                        // FIX: Refresh Settings (Trust Rules) automatically when done
+                        const refreshData = async () => {
+                            try {
+                                const [configRes, filesRes] = await Promise.all([
+                                    fetch('/api/config/trust?_t=' + Date.now()),
+                                    fetch('/api/files?_t=' + Date.now())
+                                ]);
+                                const configData = await configRes.json();
+                                const filesData = await filesRes.json();
+                                setConfig(configData);
+                                setAvailableFiles(filesData.files || []);
+                            } catch (err) { console.error(err); }
+                        };
+
+                        // Refresh data if in settings view
+                        if (viewRef.current === 'settings') {
+                            refreshData();
+                        }
+
+                        // Optional: Alert or toast notification? 
+                        // For now silent completion is preferred by user.
                     }
                 } catch (e) { }
             }, 1000);
@@ -358,6 +381,7 @@ function App() {
             const data = await res.json();
             if (res.ok) {
                 alert('Success: ' + data.message);
+                openSettings(); // Refresh Trust Rules immediately
                 setIsIngesting(true); // Start polling
             } else {
                 alert('Error: ' + data.error);

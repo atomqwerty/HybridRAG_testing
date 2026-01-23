@@ -23,6 +23,7 @@ class Config:
     # RAG Config
     RERANKER_METHOD = os.getenv("RERANKER_METHOD", "cross-encoder").lower()
     COHERE_API_KEY = os.getenv('COHERE_API_KEY')
+    USER_AGENT = os.getenv('USER_AGENT', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
     
     # Paths
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
