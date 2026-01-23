@@ -193,16 +193,51 @@ def ingest_data():
             urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
         
         if urls:
-            update_status(20, "Crawling Web...")
+            # --- PHASE 1: DISCOVERY (Parallel) ---
+            update_status(20, "Discovering Sub-pages...")
+            logger.info(f"Found {len(urls)} root URLs. Starting parallel discovery...")
+            
+            all_urls_to_process = set()
+            
+            def discover_links(root_url):
+                try:
+                    # 1. Sitemap Priority
+                    sitemap_links = get_links_from_sitemap(root_url)
+                    if sitemap_links:
+                        logger.info(f"Using {len(sitemap_links)} URLs from Sitemap for {root_url}")
+                        return sitemap_links
+                    
+                    # 2. Fallback to Crawler
+                    logger.info(f"Deep crawling {root_url}...")
+                    return get_internal_links(root_url, max_links=100)
+                except Exception as e:
+                    logger.error(f"Discovery error for {root_url}: {e}")
+                    return [root_url]
+
+            # Run Discovery in Parallel (Fast, Requests-based)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                results = executor.map(discover_links, urls)
+                for res in results:
+                    if res: all_urls_to_process.update(res)
+            
+            logger.info(f"✅ Total pages to scrape: {len(all_urls_to_process)}")
+            
+            # --- PHASE 2: EXTRACTION (Parallel) ---
+            update_status(30, f"Scraping {len(all_urls_to_process)} pages...")
+            
             def process_url(url):
                 if url in existing_sources: return []
                 try:
+                    # Stagger start to avoid spikes
                     time.sleep(random.uniform(0.5, 2.0)) 
                     return load_web_with_images(url)
-                except: return []
+                except Exception as e: 
+                    logger.warning(f"Scrape failed {url}: {e}")
+                    return []
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                results = executor.map(process_url, urls)
+            # Selenium is heavy, keep workers moderate (3-4)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                results = executor.map(process_url, list(all_urls_to_process))
                 for res in results:
                     if res: docs.extend(res)
 
