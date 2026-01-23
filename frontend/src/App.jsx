@@ -14,9 +14,10 @@ function App() {
     const [config, setConfig] = useState({ strict_mode: true, rules: [], default_score: 0.5 });
     const [availableFiles, setAvailableFiles] = useState([]);
 
-    // Ingestion State
     const [currUrl, setCurrUrl] = useState('');
     const [uploading, setUploading] = useState(false);
+    const [isIngesting, setIsIngesting] = useState(false);
+    const [ingestStatus, setIngestStatus] = useState({ percent: 0, message: '' });
 
     const messagesEndRef = useRef(null);
 
@@ -93,6 +94,41 @@ function App() {
     useEffect(() => {
         scrollToBottom();
     }, [messages]);
+
+    // Check status on load (in case user refreshed during ingestion)
+    useEffect(() => {
+        const checkStatus = async () => {
+            try {
+                const res = await fetch('/api/ingest/status');
+                const data = await res.json();
+                if (data.status === 'running') {
+                    setIsIngesting(true);
+                    setIngestStatus(data);
+                }
+            } catch (e) { }
+        };
+        checkStatus();
+    }, []);
+
+    useEffect(() => {
+        let interval;
+        if (isIngesting) {
+            interval = setInterval(async () => {
+                try {
+                    const res = await fetch('/api/ingest/status');
+                    const data = await res.json();
+                    setIngestStatus(data);
+
+                    if (data.percent >= 100) {
+                        setIsIngesting(false);
+                        setUploading(false); // Ensure button enables
+                        alert("✅ " + (data.message || "Ingestion Complete!"));
+                    }
+                } catch (e) { }
+            }, 1000);
+        }
+        return () => clearInterval(interval);
+    }, [isIngesting]);
 
     // Helper to parse bold (**text**)
     const processInlineMarkdown = (text) => {
@@ -195,42 +231,82 @@ function App() {
         const userMessage = input.trim();
         setInput('');
 
+        // 1. Add User Message
         setMessages(prev => [...prev, { type: 'user', content: userMessage }]);
+
+        // 2. Add Bot Placeholder (Empty content initially)
+        setMessages(prev => [...prev, { type: 'bot', content: '', sources: [], images: [] }]);
         setLoading(true);
 
         try {
-            // Use relative path for production (handled by proxy in dev)
-            // Use absolute URL to force connection to backend
-            const response = await fetch('/api/chat', {
+            // Use STREAMING endpoint
+            const response = await fetch('/api/chat/stream', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     message: userMessage,
                     session_id: sessionId,
-                    temperature: isCreative ? 0.3 : 0.0
+                    temperature: isCreative ? 0.3 : 0.0,
+                    history: messages.map(m => `${m.type === 'user' ? 'User' : 'Bot'}: ${m.content}`).join('\n')
                 })
             });
 
-            const data = await response.json();
-
-            if (response.ok) {
-                setMessages(prev => [...prev, {
-                    type: 'bot',
-                    content: data.response,
-                    sources: data.sources || [],
-                    images: data.images || []
-                }]);
-            } else {
-                setMessages(prev => [...prev, {
-                    type: 'error',
-                    content: `Error: ${data.error}`
-                }]);
+            if (!response.ok) {
+                const data = await response.json();
+                throw new Error(data.error || 'Failed to fetch');
             }
+
+            // 3. Read Stream
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let accumulatedContent = "";
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value, { stream: true });
+                const lines = chunk.split('\n');
+
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    try {
+                        const data = JSON.parse(line);
+
+                        setMessages(prev => {
+                            const newMsgs = [...prev];
+                            const lastMsgIndex = newMsgs.length - 1;
+                            const lastMsg = { ...newMsgs[lastMsgIndex] }; // Copy object
+
+                            if (data.type === 'meta') {
+                                // Received Sources/Images
+                                lastMsg.sources = data.sources || [];
+                                lastMsg.images = data.images || [];
+                            } else if (data.type === 'token') {
+                                // Received Text Token
+                                accumulatedContent += data.content;
+                                lastMsg.content = accumulatedContent;
+                            }
+
+                            newMsgs[lastMsgIndex] = lastMsg;
+                            return newMsgs;
+                        });
+                    } catch (e) {
+                        // console.error("Stream parse error:", e); 
+                    }
+                }
+            }
+
         } catch (error) {
-            setMessages(prev => [...prev, {
-                type: 'error',
-                content: `Connection error: ${error.message}`
-            }]);
+            console.error(error);
+            setMessages(prev => {
+                const newMsgs = [...prev];
+                newMsgs[newMsgs.length - 1] = {
+                    type: 'error',
+                    content: `Connection error: ${error.message}`
+                };
+                return newMsgs;
+            });
         } finally {
             setLoading(false);
         }
@@ -250,8 +326,10 @@ function App() {
             if (res.ok) {
                 alert('Success: ' + data.message);
                 setCurrUrl('');
+                setIsIngesting(true); // Start polling
             } else {
                 alert('Error: ' + data.error);
+                setUploading(false);
             }
         } catch (e) {
             alert('Failed to add URL');
@@ -261,13 +339,17 @@ function App() {
     };
 
     const handleFileUpload = async (e) => {
-        const file = e.target.files[0];
-        if (!file) return;
-
-        const formData = new FormData();
-        formData.append('file', file);
+        const files = e.target.files;
+        if (!files || files.length === 0) return;
 
         setUploading(true);
+        const formData = new FormData();
+
+        // Append all files
+        for (let i = 0; i < files.length; i++) {
+            formData.append('file', files[i]);
+        }
+
         try {
             const res = await fetch('/api/ingest/upload', {
                 method: 'POST',
@@ -276,13 +358,15 @@ function App() {
             const data = await res.json();
             if (res.ok) {
                 alert('Success: ' + data.message);
+                setIsIngesting(true); // Start polling
             } else {
                 alert('Error: ' + data.error);
+                setUploading(false);
             }
         } catch (e) {
             alert('Failed to upload file');
-        } finally {
             setUploading(false);
+        } finally {
             e.target.value = null; // Reset input
         }
     };
@@ -371,6 +455,7 @@ function App() {
                                     <span>Or upload file:</span>
                                     <input
                                         type="file"
+                                        multiple
                                         onChange={handleFileUpload}
                                         disabled={uploading}
                                     />
@@ -380,7 +465,7 @@ function App() {
 
 
 
-                            <h3>Trust Rules (View Only)</h3>
+                            <h3>Trust Rules Configuration</h3>
                             <div className="rules-table-container">
                                 <table className="rules-table">
                                     <thead>
@@ -429,7 +514,7 @@ function App() {
                     </div>
                 </div>
             ) : (
-                <div className="chat-window">
+                <div className="chat-container">
                     <div className="chat-header">
                         <div className="header-title">
                             <h1>Hybrid RAG Assistant</h1>
@@ -443,6 +528,18 @@ function App() {
                             </button>
                         </div>
                     </div>
+
+                    {isIngesting && (
+                        <div style={{ background: '#ebf8ff', padding: '12px 20px', borderBottom: '1px solid #e0e4e8' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px', fontSize: '0.9rem', color: '#2b6cb0' }}>
+                                <span><strong>Processing Data...</strong> {ingestStatus.message}</span>
+                                <span>{ingestStatus.percent}%</span>
+                            </div>
+                            <div style={{ width: '100%', height: '8px', background: '#bee3f8', borderRadius: '4px', overflow: 'hidden' }}>
+                                <div style={{ width: `${ingestStatus.percent}%`, height: '100%', background: '#3182ce', transition: 'width 0.5s ease' }}></div>
+                            </div>
+                        </div>
+                    )}
 
                     <div className="messages-container">
                         {messages.map((msg, idx) => (

@@ -1,47 +1,32 @@
 import os
 import glob
 import time
-import hashlib
-import uuid
+import random
 import hashlib
 import uuid
 import concurrent.futures
 from pathlib import Path
-from dotenv import load_dotenv
 from langchain_community.graphs import Neo4jGraph
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.document_loaders import PyPDFLoader, PDFPlumberLoader, Docx2txtLoader, TextLoader, UnstructuredImageLoader, WebBaseLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import TextLoader, WebBaseLoader
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_core.documents import Document
-import pdfplumber
-from vision_utils import describe_image, encode_image_from_bytes, encode_image_from_file
-from crawler import get_internal_links, get_links_from_sitemap, load_web_with_images, clean_extracted_images
-from database import get_db_connection, create_vector_index, create_fulltext_index, get_existing_sources
 
-# Load environment variables
-load_dotenv()
+from config import Config
+from logger import setup_logger
+from database import get_db_connection, create_vector_index, create_fulltext_index, get_existing_sources
+from vision_utils import describe_image, encode_image_from_file
+from crawler import get_internal_links, get_links_from_sitemap, load_web_with_images
+
+logger = setup_logger(__name__)
 
 # --- Configuration ---
-NEO4J_URI = os.getenv('NEO4J_URI')
-NEO4J_USERNAME = os.getenv('NEO4J_USERNAME')
-NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD')
-
-# API Keys
-OPENAI_API_KEY = os.getenv('OpenAi_api_key')
-OPENAI_EMB_KEY = os.getenv('OpenAi_api_key')
-OPENAI_BASE_URL = 'https://aigateway.ntictsolution.com/v1'
+# All loaded from Config
 
 def clean_graph_schema(graph):
-    """
-    Merges duplicate entities (e.g. 'Red Bull' and 'red bull') 
-    and consolidates relationships.
-    """
-    print("🧹 Cleaning and Consolidating Graph Schema...")
-    
-    # 1. Merge Duplicate Entities (Case-insensitive)
-    # This matches nodes with the same ID (lowercased) and merges them
+    """Merges duplicate entities."""
+    logger.info("Cleaning and Consolidating Graph Schema...")
     try:
         graph.query("""
             MATCH (n:Entity)
@@ -51,150 +36,98 @@ def clean_graph_schema(graph):
             YIELD node
             RETURN count(node)
         """)
-        print("   ✅ Merged duplicate entities (requires APOC plugin).")
+        logger.info("Merged duplicate entities.")
     except Exception as e:
-        print(f"   ⚠️ APOC Merge failed (APOC might not be installed): {e}")
+        logger.warning(f"APOC Merge failed: {e}")
 
-    # 2. Remove Orphan Entities (Entities with no connections)
     try:
-        graph.query("""
-            MATCH (n:Entity)
-            WHERE NOT (n)--()
-            DELETE n
-        """)
-        print("   ✅ Removed orphan entities.")
+        graph.query("MATCH (n:Entity) WHERE NOT (n)--() DELETE n")
+        logger.info("Removed orphan entities.")
     except Exception as e:
-        print(f"   ⚠️ Failed to remove orphans: {e}")
+        logger.warning(f"Failed to remove orphans: {e}")
 
 def enrich_communities(graph):
-    """
-    Runs Graph Data Science (GDS) algorithms to detect communities.
-    This helps in answering broader questions by grouping related entities.
-    """
-    print("🏙️ Detecting Communities (GDS Louvain)...")
-    
-    # Check if GDS is available
+    logger.info("Detecting Communities (GDS Louvain)...")
     try:
-        # Create In-Memory Graph projected from existing data
-        graph.query("""
-            CALL gds.graph.project(
-                'communityGraph',
-                'Entity',
-                '*'
-            )
-        """)
-        
-        # Run Louvain Algorithm
-        graph.query("""
-            CALL gds.louvain.write(
-                'communityGraph',
-                { writeProperty: 'communityId' }
-            )
-        """)
-        
-        # Cleanup projection
+        graph.query("CALL gds.graph.project('communityGraph', 'Entity', '*')")
+        graph.query("CALL gds.louvain.write('communityGraph', { writeProperty: 'communityId' })")
         graph.query("CALL gds.graph.drop('communityGraph')")
-        
-        # Index the Community IDs
         graph.query("CREATE INDEX community_id_index IF NOT EXISTS FOR (n:Entity) ON (n.communityId)")
-        
-        print("   ✅ Community detection complete. 'communityId' property added to Entities.")
-        
+        logger.info("Community detection complete.")
     except Exception as e:
-        print(f"   ⚠️ GDS Community Detection failed (GDS plugin might be missing or graph empty): {e}")
+        logger.warning(f"GDS Community Detection failed: {e}")
 
 def get_combined_chunks(docs, chunks_to_combine=3):
-    """
-    Combines multiple chunks into a single document to provide more context 
-    to the LLM during extraction.
-    """
     combined = []
-    print(f"   - Combining chunks (Group Size: {chunks_to_combine})...")
-    
     for i in range(0, len(docs), chunks_to_combine):
         batch = docs[i : i + chunks_to_combine]
-        
-        # Join content with newlines
         combined_content = "\n\n".join([d.page_content for d in batch])
         combined_ids = [d.metadata['id'] for d in batch]
-        
-        new_doc = Document(
-            page_content=combined_content,
-            metadata={"combined_chunk_ids": combined_ids}
-        )
+        new_doc = Document(page_content=combined_content, metadata={"combined_chunk_ids": combined_ids})
         combined.append(new_doc)
-    
     return combined
-
-# Database functions moved to database.py
-
-# Web crawling and scraping functions have been moved to crawler.py
 
 def ingest_data():
     start_time = time.time()
-    print("🚀 Starting ULTIMATE Hybrid RAG Data Ingestion...")
+    logger.info("Starting ULTIMATE Hybrid RAG Data Ingestion...")
     
-    # --- 1. Connect ---
-    # --- 1. Connect ---
+    def update_status(percent, message):
+        try:
+            with open(os.path.join(Config.DATA_DIR, "ingest_status.json"), "w") as f:
+                import json
+                json.dump({"percent": percent, "message": message, "status": "running"}, f)
+        except: pass
+
+    update_status(5, "Connecting to Database...")
     try:
         graph = get_db_connection()
-        print("✅ Connected to Neo4j")
+        logger.info("Connected to Neo4j")
         
+        # Check command line args
+        import sys
+        should_clear = "--reset" in sys.argv or "--clear" in sys.argv
+        if should_clear:
+            logger.warning("Running with --reset: FULL RESET ENABLED.")
+            graph.query("MATCH (n) DETACH DELETE n")
     except Exception as e:
-        print(f"❌ Failed to connect to Neo4j: {e}")
+        logger.error(f"Failed to connect to Neo4j: {e}")
         return
 
     # Initialize Models
     llm = ChatOpenAI(
-        api_key=OPENAI_API_KEY,
-        base_url=OPENAI_BASE_URL,
-        model='gpt-4o-mini',
+        api_key=Config.OPENAI_API_KEY,
+        base_url=Config.OPENAI_BASE_URL,
+        model=Config.OPENAI_MODEL,
         temperature=0
     )
 
     embeddings = OpenAIEmbeddings(
-        model='text-embedding-3-large',
-        openai_api_base=OPENAI_BASE_URL,
-        openai_api_key=OPENAI_EMB_KEY,
-        chunk_size=10
+        model=Config.OPENAI_EMBEDDING_MODEL,
+        openai_api_base=Config.OPENAI_BASE_URL,
+        openai_api_key=Config.OPENAI_API_KEY
     )
 
-    # --- 2. Load & Chunk ---
-    print("\n📂 Loading & Chunking Documents (PDF, DOCX, TXT)...")
-    
-    # Get all files in data directory
-    all_files = glob.glob("data/*")
-    start_time = time.time()
-    
-    # CLEANUP OLD DATA FIRST
-    # clean_extracted_images() # DISABLED for incremental update
-    
+    # --- Load & Chunk ---
+    logger.info("Loading & Chunking Documents...")
+    all_files = glob.glob(os.path.join(Config.DATA_DIR, "*"))
     docs = []
     existing_sources = get_existing_sources(graph)
-    print(f"   ℹ️  Found {len(existing_sources)} existing documents in DB. Skipping them.")
-
-    # Process local files
-    print("\n📂 Loading local files from data/ ...")
+    
+    update_status(10, "Loading Documents...")
     
     for file_path in all_files:
-        if os.path.basename(file_path) in existing_sources:
-             print(f"   ⏩ Skipping existing file: {os.path.basename(file_path)}")
-             continue
+        if os.path.basename(file_path) in existing_sources: continue
         ext = os.path.splitext(file_path)[1].lower()
         
         try:
             if ext == '.pdf':
-                print(f"   - Loading PDF (High-Fidelity Markdown): {os.path.basename(file_path)}")
+                logger.info(f"Loading PDF: {os.path.basename(file_path)}")
                 try:
                     import pymupdf4llm
-                    
-                    # 1. Define Image Output Directory
                     unique_id = uuid.uuid4().hex[:8]
-                    img_output_dir = Path(f"data/extracted_images/pdf_{unique_id}")
+                    img_output_dir = Path(Config.DATA_DIR) / "extracted_images" / f"pdf_{unique_id}"
                     img_output_dir.mkdir(parents=True, exist_ok=True)
                     
-                    # 2. Convert to Markdown (Layout Preserved)
-                    # write_images=True extracts images to image_path
                     md_text = pymupdf4llm.to_markdown(
                         file_path, 
                         write_images=True, 
@@ -202,341 +135,170 @@ def ingest_data():
                         image_format="jpg"
                     )
                     
-                    # 3. Analyze Extracted Images (Vision)
                     image_descriptions = ""
                     if img_output_dir.exists():
-                         print(f"      🖼️ Extracted images to {img_output_dir.name}. Analyzing...")
                          for img_file in img_output_dir.glob("*.jpg"):
-                             # Filter small icons
                              if img_file.stat().st_size < 3000: continue 
-                             
                              try:
                                  b64 = encode_image_from_file(str(img_file))
-                                 desc_path = Path("log") / (img_file.name + '_desc.txt')
+                                 desc_path = Path(Config.LOG_DIR) / (img_file.name + '_desc.txt')
                                  desc = describe_image(b64, save_description_path=str(desc_path))
-                                 
-                                 # Rel path for markdown reference
-                                 rel_path = f"data/extracted_images/pdf_{unique_id}/{img_file.name}"
+                                 rel_path = f"extracted_images/pdf_{unique_id}/{img_file.name}"
                                  image_descriptions += f"\n[IMAGE PATH: {rel_path}]\n[ANALYSIS: {desc}]\n"
                              except Exception as e:
-                                 print(f"      ⚠️ Image processing error: {e}")
+                                 logger.warning(f"Image processing error: {e}")
 
-                    # 4. Construct Final Document
                     final_content = md_text + "\n\n### EXTRACTED IMAGE ANALYSES:\n" + image_descriptions
-                    
-                    docs.append(Document(
-                        page_content=final_content,
-                        metadata={"source": os.path.basename(file_path)}
-                    ))
-                    
-                except ImportError:
-                    print("      ❌ Missing 'pymupdf4llm'. Install it first.")
+                    docs.append(Document(page_content=final_content, metadata={"source": os.path.basename(file_path)}))
                 except Exception as e:
-                    print(f"      ❌ PDF conversion failed: {e}")
-                
+                    logger.error(f"PDF conversion failed: {e}")
+
             elif ext == '.docx':
-                print(f"   - Loading DOCX (Multimodal): {os.path.basename(file_path)}")
+                logger.info(f"Loading DOCX: {os.path.basename(file_path)}")
                 try:
                     import docx2txt
-                    # Temporary directory for extracting images from this specific doc
-                    img_extract_dir = "data/extracted_images"
-                    os.makedirs(img_extract_dir, exist_ok=True)
-                    
-                    # Extract text and save images
-                    text = docx2txt.process(file_path, img_extract_dir)
-                    
-                    # Now find the images that were just extracted
-                    # docx2txt naming convention isn't easily predictable for mapping exact position,
-                    # so we append all new images found to the end of the text.
-                    # A more robust way requires unzip manipulation, but this works for RAG context.
-                    
-                    # We can iterate over all images in that dir checking creation time? 
-                    # Simpler: docx2txt saves them as 'image1.png', 'image2.jpg', etc. 
-                    # We might clash if we don't manage names. 
-                    # BETTER STRATEGY: Rename them immediately or use a unique temp dir per file.
-                    
-                    # RE-DO: Use a unique sub-folder for this file
                     unique_id = uuid.uuid4().hex[:8]
-                    temp_img_dir = Path(f"data/extracted_images/docx_{unique_id}")
+                    temp_img_dir = Path(Config.DATA_DIR) / "extracted_images" / f"docx_{unique_id}"
                     temp_img_dir.mkdir(parents=True, exist_ok=True)
-                    
                     text = docx2txt.process(file_path, str(temp_img_dir))
                     
-                    # Iterate over extracted images
                     image_descriptions = ""
                     if temp_img_dir.exists():
                         for img_file in temp_img_dir.iterdir():
                             if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
-                                print(f"      🖼️ Found DOCX Image: {img_file.name}")
-                                
-                                b64 = encode_image_from_file(str(img_file))
-                                
-                                log_dir = Path("log")
-                                log_dir.mkdir(parents=True, exist_ok=True)
-                                desc_path = log_dir / (img_file.name + '_description.txt')
-                                
-                                desc = describe_image(b64, save_description_path=str(desc_path))
-                                image_descriptions += f"\n[IMAGE PATH: {img_file}]\n{desc}\n"
-                    
-                    full_content = text + "\n\n### EXTRACTED IMAGES FROM DOCX:\n" + image_descriptions
+                                try:
+                                    b64 = encode_image_from_file(str(img_file))
+                                    desc = describe_image(b64)
+                                    image_descriptions += f"\n[IMAGE PATH: {img_file}]\n{desc}\n"
+                                except: pass
                     
                     docs.append(Document(
-                        page_content=full_content,
+                        page_content=text + "\n\n### IMAGES:\n" + image_descriptions,
                         metadata={"source": os.path.basename(file_path)}
                     ))
-                    
-                except ImportError:
-                     print("      ❌ Missing 'docx2txt'. Install it: `pip install docx2txt`")
-                     
+                except Exception as e: logger.error(f"DOCX failed: {e}")
+
             elif ext == '.txt':
-                 # Skip the config file for URLs, processed later
-                 if os.path.basename(file_path) == "urls.txt":
-                     continue
-                     
-                 print(f"   - Loading TXT: {os.path.basename(file_path)}")
+                 if os.path.basename(file_path) == "urls.txt": continue
                  loader = TextLoader(file_path)
                  docs.extend(loader.load())
 
-            elif ext in ['.png', '.jpg', '.jpeg']:
-                 print(f"   - Loading Image: {os.path.basename(file_path)}")
-                 b64 = encode_image_from_file(file_path)
-                 
-                 # Save description to log directory
-                 desc_filename = Path(file_path).stem + '_description.txt'
-                 log_dir = Path("log")
-                 if not log_dir.exists():
-                     log_dir.mkdir(parents=True, exist_ok=True)
-                 desc_path = log_dir / desc_filename
-                 desc = describe_image(b64, save_description_path=str(desc_path))
-                 
-                 # Store the image path relative to project root
-                 abs_file_path = Path(file_path).resolve()
-                 try:
-                     img_path = abs_file_path.relative_to(Path.cwd())
-                 except ValueError:
-                     # If relative_to fails, just use the file path as-is
-                     img_path = Path(file_path)
-                 
-                 doc = Document(
-                     page_content=f"[IMAGE PATH: {img_path}]\n[IMAGE FILE SOURCE: {os.path.basename(file_path)}]\n{desc}",
-                     metadata={"source": os.path.basename(file_path)}
-                 )
-                 docs.append(doc)
-                 
-            else:
-                pass # Skip unknown
-                
         except Exception as e:
-            print(f"   ⚠️ Failed to load {file_path}: {e}")
-            
-    if not docs and not os.path.exists("data/urls.txt"):
-        print("❌ No documents or URLs found. Exiting.")
-        return
+            logger.warning(f"Failed to load {file_path}: {e}")
 
-    # --- 2b. Load from Web (if urls.txt exists) ---
-    url_file = "data/urls.txt"
+    # Load from URLs
+    url_file = os.path.join(Config.DATA_DIR, "urls.txt")
     if os.path.exists(url_file):
-        print(f"\n🌐 Found {url_file}, loading websites...")
         with open(url_file, "r") as f:
             urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
         
         if urls:
-            print(f"   - Found {len(urls)} root URLs.")
-            all_urls_to_process = set()
-            
-            # 1. Expand URLs (SItemap First -> Crawl Fallback)
-            for root_url in urls:
-                print(f"   🔎 Discovering content for: {root_url}")
-                
-                # Check Sitemap
-                sitemap_links = get_links_from_sitemap(root_url)
-                
-                if sitemap_links:
-                     print(f"      🚀 Using {len(sitemap_links)} URLs from Sitemap (skipping crawler).")
-                     all_urls_to_process.update(sitemap_links)
-                else:
-                     # Fallback to Crawl (Deep Curl)
-                     print(f"      🕸️ No sitemap found. Falling back to deep crawler...")
-                     sub_links = get_internal_links(root_url, max_links=100) 
-                     all_urls_to_process.update(sub_links)
-            
-            print(f"   - Processing {len(all_urls_to_process)} total pages (Root + Sub-pages)...")
-            
-            # 2. Scrape Each
-            for url in all_urls_to_process:
-                if url in existing_sources:
-                     print(f"   ⏩ Skipping existing URL: {url}")
-                     continue
+            update_status(20, "Crawling Web...")
+            def process_url(url):
+                if url in existing_sources: return []
                 try:
-                    web_docs = load_web_with_images(url)
-                    docs.extend(web_docs)
-                except Exception as e:
-                     print(f"      ⚠️ Failed to load {url}: {e}")
-        else:
-            print("   (urls.txt is empty)")
-            
-    if not docs:
-        print("❌ No content loaded (files or web). Exiting.")
-        return
-    
-    # --- Smart Chunking Logic ---
-    print("   (Applying Smart Hybrid Chunking: Tables -> Page-Based, Text -> Semantic Split)")
-    
-    def is_table_page(text):
-        """
-        Detects if a page looks like a table based on structural layout 
-        (multiple columns separated by whitespace).
-        """
-        lines = text.split('\n')
-        table_like_lines = 0
-        for line in lines:
-            # Check for at least 3 columns separated by 3+ spaces
-            columns = [c for c in line.split('   ') if c.strip()]
-            if len(columns) >= 3:
-                table_like_lines += 1
-        
-        # If >5 lines align like a table, treat page as a table
-        return table_like_lines >= 5
+                    time.sleep(random.uniform(0.5, 2.0)) 
+                    return load_web_with_images(url)
+                except: return []
 
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                results = executor.map(process_url, urls)
+                for res in results:
+                    if res: docs.extend(res)
+
+    if not docs:
+        logger.info("No content loaded. Exiting.")
+        return
+
+    # Chunking
+    update_status(40, "Chunking Content...")
     final_chunks = []
-    # Initialize Semantic Chunker for better narrative splitting
-    # "percentile" threshold works well for general text
     semantic_splitter = SemanticChunker(embeddings, breakpoint_threshold_type="percentile")
 
-    for i, doc in enumerate(docs):
-        print(f"      - Chunking document {i+1}/{len(docs)}...", end='\r') # Dynamic progress line
-        
-        # Check if this is an image document (contains [IMAGE PATH:])
-        if '[IMAGE PATH:' in doc.page_content or '[IMAGE FILE SOURCE:' in doc.page_content:
-            print(f"      - Image document detected. Keeping intact: {doc.metadata.get('source', 'Unknown')}")
-            final_chunks.append(doc)
-        elif is_table_page(doc.page_content):
-            print(f"      - Page {doc.metadata.get('page', '?')}: Table detected. Keeping intact.")
+    for doc in docs:
+        if '[IMAGE PATH:' in doc.page_content:
             final_chunks.append(doc)
         else:
-            # Normal text page -> Semantic Split
             try:
                 splits = semantic_splitter.split_documents([doc])
                 final_chunks.extend(splits)
-            except Exception as e:
-                print(f"      ⚠️ Semantic chunking failed on page {doc.metadata.get('page', '?')}, falling back to whole page: {e}")
+            except:
                 final_chunks.append(doc)
-            
-    raw_chunks = final_chunks
-    
-    # Process ALL chunks for Production
-    processed_chunks = raw_chunks
-    # processed_chunks = raw_chunks[:100] # Uncomment for testing 
 
-    # --- 3. Prepare Attributes (UUIDs + Embeddings) ---
-    print(f"   - Processing {len(processed_chunks)} chunks...")
-    chunk_data_for_cypher = []
+    # Prepare for Cypher
+    update_status(50, "Embedding Chunks...")
+    chunk_data = []
     chunks_with_metadata = []
-    
-    batch_emb = embeddings.embed_documents([c.page_content for c in processed_chunks])
+    batch_emb = embeddings.embed_documents([c.page_content for c in final_chunks])
 
-    for i, chunk in enumerate(processed_chunks):
+    for i, chunk in enumerate(final_chunks):
         chunk_id = hashlib.md5(chunk.page_content.encode()).hexdigest()
-        source_file = chunk.metadata.get('source', 'unknown')
+        source = chunk.metadata.get('source', 'unknown')
+        chunk.metadata['id'] = chunk_id
+        chunks_with_metadata.append(chunk)
         
-        chunk_doc = Document(
-            page_content=chunk.page_content,
-            metadata={'id': chunk_id, 'source': source_file}
-        )
-        chunks_with_metadata.append(chunk_doc)
-        
-        chunk_data_for_cypher.append({
+        chunk_data.append({
             'id': chunk_id,
             'text': chunk.page_content,
-            'source': source_file,
-            'page': chunk.metadata.get('page', None),
-            'embedding': batch_emb[i]
+            'source': source,
+            'page': chunk.metadata.get('page'),
+            'embedding': batch_emb[i],
+            'seq': i
         })
 
-    # --- 4. Ingest Chunks (Vector Node) ---
-    print("\n💾 Ingesting Chunks...")
+    # Ingest Chunks
+    update_status(60, "Writing to Neo4j...")
     graph.query("""
         UNWIND $batch AS data
         MERGE (c:Chunk {id: data.id})
-        SET c.text = data.text, c.source = data.source, c.page = data.page, c.embedding = data.embedding
-    """, {'batch': chunk_data_for_cypher})
+        SET c.text = data.text, c.source = data.source, c.page = data.page, c.embedding = data.embedding, c.seq = data.seq
+    """, {'batch': chunk_data})
     
-    create_vector_index(graph, dimensions=3072)
+    # Create Relations
+    graph.query("""
+        MATCH (c:Chunk)
+        WITH c.source AS src, c
+        ORDER BY c.seq ASC
+        WITH src, collect(c) as chunks
+        UNWIND range(0, size(chunks)-2) AS i
+        WITH chunks[i] AS c1, chunks[i+1] AS c2
+        MERGE (c1)-[:NEXT]->(c2)
+    """)
+    
+    create_vector_index(graph)
     create_fulltext_index(graph)
 
-    # --- 5. Extract Graph (LLM) ---
-    print("\n🕸️ Extracting Graph Knowledge (with Chunk Combination)...")
+    # Extract Entities
+    update_status(80, "Extracting Knowledge Graph...")
+    combined_docs = get_combined_chunks(chunks_with_metadata, 4)
+    # Default F1 Schema just in case env is not set
+    allowed_nodes = ["Person", "Organization", "Event", "Location", "Product", "Service"]
+    allowed_rels = ["WORKS_FOR", "LOCATED_AT", "PARTICIPATED_IN", "CREATED", "OFFERS"]
     
-    # Combine chunks (increase to 4 for speed/efficiency with GPT-4o)
-    combined_docs = get_combined_chunks(chunks_with_metadata, chunks_to_combine=4)
-    
-     # Configuration for Extraction
-    # Can be set in .env. If "OPEN", extraction is unrestricted.
-    env_nodes = os.getenv('ALLOWED_NODES')
-    env_rels = os.getenv('ALLOWED_RELATIONSHIPS')
-    
-    if env_nodes == "OPEN":
-        allowed_nodes = [] # Unrestricted
-        print("   - Strategy: Open Extraction (No Node Constraints)")
-    elif env_nodes:
-        allowed_nodes = [n.strip() for n in env_nodes.split(',') if n.strip()]
-        print(f"   - Strategy: Custom Nodes from Env: {allowed_nodes}")
-    else:
-        # Default to F1 SCHEMA (Better structured data)
-        allowed_nodes = ["Driver", "Team", "Person", "Car", "Part", "Race", "Circuit", "Location", "Year", "Event", "Organization"]
-        print(f"   - Strategy: Default F1 Schema Nodes: {allowed_nodes}")
-
-    if env_rels == "OPEN":
-        allowed_rels = [] # Unrestricted
-        print("   - Strategy: Open Extraction (No Relationship Constraints)")
-    elif env_rels:
-        allowed_rels = [r.strip() for r in env_rels.split(',') if r.strip()]
-        # Simple validation could go here later if needed
-        print(f"   - Strategy: Custom Relationships from Env: {allowed_rels}")
-    else:
-        # Default to F1 SCHEMA
-        allowed_rels = ["DRIVES_FOR", "WORKS_FOR", "LOCATED_AT", "PARTICIPATED_IN", "WON", "HAS_PART", "OCCURRED_IN", "ALSO_KNOWN_AS", "HAS_BUDGET", "EARNED"]
-        print(f"   - Strategy: Default F1 Schema Relationships: {allowed_rels}")
-
     llm_transformer = LLMGraphTransformer(
         llm=llm,
         allowed_nodes=allowed_nodes,
         allowed_relationships=allowed_rels
     )
     
-    # Process in Smaller Batches
-    # Process in Smaller Batches
-    BATCH_SIZE = 5
-    total_batches = (len(combined_docs) + BATCH_SIZE - 1) // BATCH_SIZE
-
-    def process_batch(batch_idx):
-        start = batch_idx * BATCH_SIZE
-        end = start + BATCH_SIZE
-        batch_combined = combined_docs[start:end]
-        
-        print(f"   - Processing Batch {batch_idx + 1}/{total_batches} ({len(batch_combined)} docs)...")
-        try:
-            return llm_transformer.convert_to_graph_documents(batch_combined)
-        except Exception as e:
-            print(f"      ⚠️ Batch {batch_idx + 1} failed: {e}")
-            return []
-
-    print(f"   🚀 Running Extraction in Parallel (4 Workers)...")
-    
     all_graph_docs = []
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        results = executor.map(process_batch, range(total_batches))
-        for res in results:
-            if res:
-                all_graph_docs.extend(res)
+    def process_batch(batch):
+        try: return llm_transformer.convert_to_graph_documents(batch)
+        except: return []
 
-    print(f"   ✅ Extraction Complete. Adding {len(all_graph_docs)} graph documents to Neo4j...")
-    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = []
+        batch_size = 5
+        for i in range(0, len(combined_docs), batch_size):
+            futures.append(executor.submit(process_batch, combined_docs[i:i+batch_size]))
+        
+        for f in concurrent.futures.as_completed(futures):
+            res = f.result()
+            if res: all_graph_docs.extend(res)
+
     if all_graph_docs:
         graph.add_graph_documents(all_graph_docs)
-        
-        # Link Entities to ALL Source Chunks
+        # Link Entities to Chunks
         for g_doc in all_graph_docs:
             chunk_ids = g_doc.source.metadata.get('combined_chunk_ids', [])
             for chunk_id in chunk_ids:
@@ -546,23 +308,14 @@ def ingest_data():
                         MERGE (e:Entity {id: $node_id})
                         ON CREATE SET e.type = $node_type
                         MERGE (c)-[:HAS_ENTITY]->(e)
-                    """, {
-                        'chunk_id': chunk_id,
-                        'node_id': node.id,
-                        'node_type': node.type
-                    })
+                    """, {'chunk_id': chunk_id, 'node_id': node.id, 'node_type': node.type})
 
-    # --- 6. Post-Processing ---
     clean_graph_schema(graph)
     enrich_communities(graph)
     
-    end_time = time.time()
-    duration = end_time - start_time
-    minutes = int(duration // 60)
-    seconds = int(duration % 60)
-    
-    print(f"\n🎉 Ultimate Ingestion Complete!")
-    print(f"⏱️ Total Time Taken: {minutes}m {seconds}s")
+    duration = time.time() - start_time
+    logger.info(f"Ingestion Complete! Time: {int(duration)}s")
+    update_status(100, "Ingestion Complete!")
 
 if __name__ == "__main__":
     ingest_data()

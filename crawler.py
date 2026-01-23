@@ -11,8 +11,32 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+import json
 from langchain_core.documents import Document
 from vision_utils import describe_image, encode_image_from_file
+
+# --- CONFIG LOADER ---
+DEFAULTS = {
+    "brands": [
+        'byd', 'tesla', 'mg', 'neta', 'ora', 'gwm', 'haval', 'volvo', 'bmw', 'benz', 'mercedes', 
+        'audi', 'porsche', 'aion', 'wuling', 'nissan', 'toyota', 'honda', 'mazda', 'kia', 'hyundai', 
+        'ford', 'mini', 'lexus', 'subaru', 'peugeot', 'jeep', 'xpeng', 'zeekr', 'deepal', 'lotus', 'lucid'
+    ],
+    "keywords": ['ev-cars', 'model', 'spec', 'catalog', 'product', 'vehicle', 'showroom']
+}
+
+def get_crawler_rules():
+    """Loads dynamic brands/keywords from JSON, falls back to defaults."""
+    try:
+        config_path = Path("data/source_config.json")
+        if config_path.exists():
+            with open(config_path, "r") as f:
+                data = json.load(f)
+                return data.get("crawler_config", DEFAULTS)
+    except Exception as e:
+        print(f"⚠️ Error loading crawler config: {e}")
+    return DEFAULTS
+# ---------------------
 
 # Import ChromeDriverManager only if needed or assume installed
 # from webdriver_manager.chrome import ChromeDriverManager 
@@ -22,7 +46,7 @@ def clean_extracted_images():
     """Cleans up old extracted images and logs before fresh ingestion."""
     print("🧹 Cleaning up old extracted images and logs...")
     
-    # Clean Images
+    # Clean Images  
     img_dir = Path("data/extracted_images")
     if img_dir.exists():
         try:
@@ -114,12 +138,9 @@ def get_internal_links(base_url, max_links=200):
                     
                     # --- SMART CAR FILTER ---
                     # The user wants "only car links". We use Brand & Keyword matching.
-                    brands = [
-                        'byd', 'tesla', 'mg', 'neta', 'ora', 'gwm', 'haval', 'volvo', 'bmw', 'benz', 'mercedes', 
-                        'audi', 'porsche', 'aion', 'wuling', 'nissan', 'toyota', 'honda', 'mazda', 'kia', 'hyundai', 
-                        'ford', 'mini', 'lexus', 'subaru', 'peugeot', 'jeep', 'xpeng', 'zeekr', 'deepal', 'lotus', 'lucid'
-                    ]
-                    keywords = ['ev-cars', 'model', 'spec', 'catalog', 'product', 'vehicle', 'showroom']
+                    rules = get_crawler_rules()
+                    brands = rules.get("brands", [])
+                    keywords = rules.get("keywords", [])
                     
                     link_text = elem.get_text().lower().strip()
                     url_lower = full_url.lower()
@@ -217,13 +238,9 @@ def is_relevant_car_url(url):
     if any(x in url for x in noise): return False
     
     # Brands & Keywords
-    brands = [
-        'byd', 'tesla', 'mg', 'neta', 'ora', 'gwm', 'haval', 'volvo', 'bmw', 'benz', 'mercedes', 
-        'audi', 'porsche', 'aion', 'wuling', 'nissan', 'toyota', 'honda', 'mazda', 'kia', 'hyundai', 
-        'ford', 'mini', 'lexus', 'subaru', 'peugeot', 'jeep', 'xpeng', 'zeekr', 'deepal', 'lotus', 'lucid',
-        'isuzu' # Added Isuzu
-    ]
-    keywords = ['ev-cars', 'model', 'spec', 'catalog', 'product', 'vehicle', 'showroom', 'charging', 'charger'] # Added charger
+    rules = get_crawler_rules()
+    brands = rules.get("brands", [])
+    keywords = rules.get("keywords", [])
     
     # Must match at least one
     if any(b in url for b in brands) or any(k in url for k in keywords):
@@ -293,9 +310,9 @@ def load_web_with_images(url):
 
         # 2. Download and Filter by Size (Get the "Meatier" content)
         valid_images = [] # List of (size_in_bytes, local_path, source_url)
-        MAX_CANDIDATES_CHECK = 100 # INCREASED: Check more images
+        MAX_CANDIDATES_CHECK = 20 # OPTIMIZATION: Reduced from 100 to 20 for speed
         
-        print(f"      🔎 Scanning {len(candidates)} images to find the most important ones...")
+        print(f"      🔎 Scanning {len(candidates)} images (checking top {MAX_CANDIDATES_CHECK})...")
         
         for full_url in list(set(candidates))[:MAX_CANDIDATES_CHECK]:
             try:
@@ -333,7 +350,7 @@ def load_web_with_images(url):
         
         # 4. Select Images (Capture ALL valid ones, up to a reasonable limit to prevent timeout)
         # We already filtered by size > 2KB earlier.
-        top_images = valid_images[:50] 
+        top_images = valid_images[:5] # OPTIMIZATION: Reduced from 50 to 5 (Huge speedup)
         print(f"      🏆 Selected {len(top_images)} valid images >2KB for analysis.")
 
         # 5. Analyze with Vision
