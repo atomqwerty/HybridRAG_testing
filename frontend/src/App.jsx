@@ -19,6 +19,122 @@ function App() {
     const [isIngesting, setIsIngesting] = useState(false);
     const [ingestStatus, setIngestStatus] = useState({ percent: 0, message: '' });
 
+    // --- Status & Notification State ---
+    const [uploadStatus, setUploadStatus] = useState(null); // { type: 'success'|'error', msg: '' }
+
+    // Helper: Clear status after 3 seconds
+    const showStatus = (type, msg) => {
+        setUploadStatus({ type, msg });
+        setTimeout(() => setUploadStatus(null), 5000);
+    };
+
+    // --- Drag and Drop Logic ---
+    const [isDragging, setIsDragging] = useState(false);
+
+    const handleDrag = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.type === 'dragenter' || e.type === 'dragover') {
+            setIsDragging(true);
+        } else if (e.type === 'dragleave') {
+            setIsDragging(false);
+        }
+    };
+
+    const traverseFileTree = (item, path = "") => {
+        return new Promise((resolve) => {
+            if (item.isFile) {
+                item.file((file) => {
+                    resolve([file]);
+                });
+            } else if (item.isDirectory) {
+                const dirReader = item.createReader();
+                dirReader.readEntries(async (entries) => {
+                    let files = [];
+                    for (let i = 0; i < entries.length; i++) {
+                        const subFiles = await traverseFileTree(entries[i], path + item.name + "/");
+                        files = files.concat(subFiles);
+                    }
+                    resolve(files);
+                });
+            } else {
+                resolve([]);
+            }
+        });
+    };
+
+    // Helper to refresh data without changing view
+    const refreshSettingsData = async () => {
+        try {
+            const [configRes, filesRes] = await Promise.all([
+                fetch('/api/config/trust?_t=' + Date.now()),
+                fetch('/api/files?_t=' + Date.now())
+            ]);
+            const configData = await configRes.json();
+            const filesData = await filesRes.json();
+            setConfig(configData);
+            setAvailableFiles(filesData.files || []);
+        } catch (err) {
+            console.error("Failed to refresh settings data", err);
+        }
+    };
+
+    const handleDrop = async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragging(false);
+
+        const items = e.dataTransfer.items;
+        if (!items || items.length === 0) return;
+
+        setUploading(true);
+        const formData = new FormData();
+        let fileCount = 0;
+
+        try {
+            const filePromises = [];
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i].webkitGetAsEntry();
+                if (item) {
+                    filePromises.push(traverseFileTree(item));
+                }
+            }
+
+            const results = await Promise.all(filePromises);
+            const flatFiles = results.flat();
+
+            if (flatFiles.length === 0) {
+                showStatus('error', "No valid files found in drop.");
+                setUploading(false);
+                return;
+            }
+
+            for (const file of flatFiles) {
+                formData.append('file', file);
+                fileCount++;
+            }
+
+            // Reuse the existing fetch logic
+            const res = await fetch('/api/ingest/upload', {
+                method: 'POST',
+                body: formData
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showStatus('success', `Success: Processed ${fileCount} files.`);
+                await refreshSettingsData(); // Refresh immediately
+                setIsIngesting(true);
+            } else {
+                showStatus('error', 'Error: ' + data.error);
+            }
+        } catch (error) {
+            console.error(error);
+            showStatus('error', "Drag and drop failed");
+        } finally {
+            setUploading(false);
+        }
+    };
+
     const messagesEndRef = useRef(null);
     const viewRef = useRef(view);
 
@@ -26,21 +142,8 @@ function App() {
 
     // Fetch Config on open settings
     const openSettings = async () => {
-        try {
-            const [configRes, filesRes] = await Promise.all([
-                fetch('/api/config/trust?_t=' + Date.now()),
-                fetch('/api/files?_t=' + Date.now())
-            ]);
-
-            const configData = await configRes.json();
-            const filesData = await filesRes.json();
-
-            setConfig(configData);
-            setAvailableFiles(filesData.files || []);
-            setView('settings');
-        } catch (err) {
-            console.error("Failed to load settings", err);
-        }
+        await refreshSettingsData();
+        setView('settings');
     };
 
     const saveSettings = async () => {
@@ -401,10 +504,14 @@ function App() {
         try {
             const res = await fetch('/api/admin/clear_db', { method: 'POST' });
             const data = await res.json();
-            if (res.ok) alert(data.message);
-            else alert("Error: " + data.error);
+            if (res.ok) {
+                showStatus('success', "Database Cleared: " + data.message);
+                await refreshSettingsData(); // Refresh immediately
+            } else {
+                showStatus('error', "Error: " + data.error);
+            }
         } catch (e) {
-            alert("Failed to clear database");
+            showStatus('error', "Failed to clear database");
         }
     };
 
@@ -475,15 +582,58 @@ function App() {
                                     </button>
                                 </div>
 
-                                <div className="ingest-row upload-row">
-                                    <span>Or upload file:</span>
-                                    <input
-                                        type="file"
-                                        multiple
-                                        onChange={handleFileUpload}
-                                        disabled={uploading}
-                                    />
-                                    {uploading && <span className="status-text">Ingesting...</span>}
+                                <div
+                                    className={`ingest-row upload-row drop-zone ${isDragging ? 'drag-active' : ''}`}
+                                    onDragEnter={handleDrag}
+                                    onDragOver={handleDrag}
+                                    onDragLeave={handleDrag}
+                                    onDrop={handleDrop}
+                                    style={{
+                                        flexDirection: 'column',
+                                        alignItems: 'center',
+                                        gap: '15px',
+                                        border: isDragging ? '2px dashed #4299e1' : '2px dashed #4a5568',
+                                        backgroundColor: isDragging ? 'rgba(66, 153, 225, 0.1)' : 'rgba(0, 0, 0, 0.2)',
+                                        padding: '30px',
+                                        borderRadius: '10px',
+                                        transition: 'all 0.2s ease',
+                                        cursor: 'default'
+                                    }}
+                                >
+                                    <div style={{ fontSize: '2rem' }}>📂</div>
+                                    <span style={{ color: '#a0aec0', fontWeight: 'bold' }}>Drag & Drop Files or Folders Here</span>
+                                    <span style={{ color: '#718096', fontSize: '0.9rem' }}>-- OR --</span>
+
+                                    <div style={{ display: 'flex', gap: '10px' }}>
+                                        {/* File Upload Button */}
+                                        <label className="btn-primary" style={{ cursor: 'pointer', margin: 0, fontSize: '0.9rem', padding: '8px 16px' }}>
+                                            Select Files manually
+                                            <input
+                                                type="file"
+                                                multiple
+                                                onChange={handleFileUpload}
+                                                disabled={uploading}
+                                                style={{ display: 'none' }}
+                                            />
+                                        </label>
+                                    </div>
+
+                                    {uploadStatus && (
+                                        <div style={{
+                                            padding: '8px 12px',
+                                            borderRadius: '6px',
+                                            fontSize: '0.9rem',
+                                            marginBottom: '8px',
+                                            width: '100%',
+                                            textAlign: 'center',
+                                            background: uploadStatus.type === 'success' ? '#d1fae5' : '#fee2e2',
+                                            color: uploadStatus.type === 'success' ? '#065f46' : '#991b1b',
+                                            border: uploadStatus.type === 'success' ? '1px solid #34d399' : '1px solid #f87171'
+                                        }}>
+                                            {uploadStatus.type === 'success' ? '✅ ' : '⚠️ '} {uploadStatus.msg}
+                                        </div>
+                                    )}
+                                    {uploading && <span className="status-text" style={{ color: '#48bb78' }}>Processing Upload...</span>}
                                 </div>
                             </div>
 

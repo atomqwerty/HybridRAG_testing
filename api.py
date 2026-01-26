@@ -305,15 +305,30 @@ def run_ingestion_background():
     except: pass
 
     def _run():
-        logger.info("Starting Ingestion Process...")
+        logger.info("Starting Ingestion Process (DLT Pipeline)...")
         try:
-            result = subprocess.run([sys.executable, "ingest_graph.py"], cwd=os.getcwd(), capture_output=True, text=True)
+            # TRIGGER THE NEW DLT PIPELINE
+            result = subprocess.run([sys.executable, "ingest_dlt.py"], cwd=os.getcwd(), capture_output=True, text=True)
             if result.returncode == 0:
                 logger.info("Ingestion Complete!")
+                # Update status file to 100%
+                try:
+                    with open(os.path.join(Config.DATA_DIR, "ingest_status.json"), "w") as f:
+                        json.dump({"percent": 100, "message": "Done!", "status": "completed"}, f)
+                except: pass
             else:
                 logger.error(f"Ingestion Failed: {result.stderr}")
+                try:
+                    with open(os.path.join(Config.DATA_DIR, "ingest_status.json"), "w") as f:
+                        # Capture more of the error (500 chars) for debugging
+                        json.dump({"percent": 0, "message": f"Failed: {result.stderr[:500]}", "status": "error"}, f)
+                except: pass
         except Exception as e:
             logger.error(f"Ingestion Error: {e}")
+            try:
+                with open(os.path.join(Config.DATA_DIR, "ingest_status.json"), "w") as f:
+                    json.dump({"percent": 0, "message": str(e), "status": "error"}, f)
+            except: pass
     threading.Thread(target=_run).start()
 
 def auto_add_trust_rule(pattern, score=1.0, rule_type='file'):
@@ -380,7 +395,7 @@ def upload_file_source():
             
             save_path = os.path.join(Config.DATA_DIR, filename)
             file.save(save_path)
-            auto_add_trust_rule(filename)
+            # auto_add_trust_rule(filename) -> Moved to ingest_dlt.py to show only after finish
             uploaded_count += 1
             
         if uploaded_count > 0:
