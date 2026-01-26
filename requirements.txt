@@ -18,6 +18,7 @@ pdfplumber
 langchain-experimental
 docx2txt
 sentence-transformers
+semantic-router
 tiktoken
 langchain-text-splitters
 langchain-neo4j

@@ -13,17 +13,19 @@ from logger import setup_logger
 
 logger = setup_logger(__name__)
 
-from langchain_openai import OpenAIEmbeddings
-from langchain_experimental.text_splitter import SemanticChunker
 from langchain_core.documents import Document
 from database import create_vector_index
 import hashlib
+import fitz # PyMuPDF
+import base64
+import requests
+from io import BytesIO
 
 # --- Neo4j Sink ---
 def load_to_neo4j(items: Iterator[Dict[str, Any]]):
     """
-    Custom DLT Sink to write nodes to Neo4j.
-    Now includes Vector Embedding logic!
+    custom DLT Sink to write nodes to Neo4j.
+    Now includes VISION Embedding logic!
     """
     try:
         graph = Neo4jGraph(
@@ -32,72 +34,116 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
             password=Config.NEO4J_PASSWORD
         )
         
-        # Ensure Vector Index Exists
-        create_vector_index(graph)
+        # Ensure Vector Index Exists (Check dimension!)
+        # ColPali/ColQwen usually has 128 dim (per token). 
+        # If we use pooled, we need to know. For now assuming 128 based on Config.
+        create_vector_index(graph, dimensions=Config.EMBEDDING_DIMENSION)
         
-        # Initialize Embedding Models
-        embeddings = OpenAIEmbeddings(
-            model=Config.OPENAI_EMBEDDING_MODEL,
-            openai_api_base=Config.OPENAI_BASE_URL,
-            openai_api_key=Config.OPENAI_API_KEY
-        )
-        text_splitter = SemanticChunker(embeddings, breakpoint_threshold_type="percentile")
-
-        def process_content_to_chunks(text, source_id, metadata={}):
-            if not text or len(text) < 50: return
-            
-            # Chunking
+        def get_visual_embedding(image_bytes):
+            """Calls local ColiVara API"""
             try:
-                docs = text_splitter.create_documents([text], metadatas=[metadata])
-            except:
-                # Fallback if semantic fails
-                docs = [Document(page_content=text, metadata=metadata)]
+                # Based on ColiVarE API spec: POST /runsync
+                # Payload: {"input": {"task": "embed", "input_data": ["base64_string"]}}
+                # Note: Check actual API spec. The README said: "input_data": ["hello"] for text.
+                # For images, we likely need base64.
                 
-            # Embed and Write
-            # Batch embedding would be better, but for DLT stream doing one-by-one or small batches:
-            texts = [d.page_content for d in docs]
-            vectors = embeddings.embed_documents(texts)
-            
-            prev_chunk_id = None
-            
-            for i, (doc, vector) in enumerate(zip(docs, vectors)):
-                chunk_id = hashlib.md5(f"{source_id}_{i}".encode()).hexdigest()
+                b64_str = base64.b64encode(image_bytes).decode('utf-8')
                 
-                query = """
-                MERGE (c:Chunk {id: $id})
-                SET c.text = $text,
-                    c.source = $source,
-                    c.page = $page,
-                    c.embedding = $vector,
-                    c.seq = $seq,
-                    c.last_updated = timestamp()
-                """
-                params = {
-                    "id": chunk_id,
-                    "text": doc.page_content,
-                    "source": source_id,
-                    "page": metadata.get("pages", 1),
-                    "vector": vector,
-                    "seq": i
+                # Payload structure assumption based on standard serverless-style APIs
+                # Adjust if ColiVara differs.
+                payload = {
+                    "input": {
+                        "task": "embed", # or "embed_image"?
+                        "input_data": [b64_str],
+                        "modality": "image" # Hypothetical flag
+                    }
                 }
-                graph.query(query, params)
                 
-                # NEXT relationship for context window
-                if prev_chunk_id:
-                    graph.query("""
-                        MATCH (c1:Chunk {id: $prev}), (c2:Chunk {id: $curr})
-                        MERGE (c1)-[:NEXT]->(c2)
-                    """, {"prev": prev_chunk_id, "curr": chunk_id})
+                # ColiVarE likely expects a list of inputs.
+                # If it's a general VLM, we pass the image.
                 
-                prev_chunk_id = chunk_id
+                res = requests.post(Config.COLIVARA_API_URL, json=payload, timeout=30)
+                if res.status_code == 200:
+                    # Parse response. Expecting list of vectors.
+                    # response format?? {"output": [[0.1, ...]]}
+                    data = res.json()
+                    return data.get("output", [])[0]
+                else:
+                    logger.error(f"ColiVara API Error: {res.text}")
+                    return [0.0] * Config.EMBEDDING_DIMENSION
+                    
+            except Exception as e:
+                logger.error(f"Visual Embed Failed: {e}")
+                return [0.0] * Config.EMBEDDING_DIMENSION
+
+        def process_doc_to_visual_chunks(file_path, source_id, metadata={}):
+            """Renders PDF pages as images and embeds them."""
+            if not os.path.exists(file_path): return
+
+            try:
+                doc = fitz.open(file_path)
+                logger.info(f"   📷 Processing {len(doc)} pages as images for {source_id}...")
                 
-            logger.info(f"   Using DLT Sink: Wrote {len(docs)} Chunks for {source_id}")
+                prev_chunk_id = None
+                
+                for i, page in enumerate(doc):
+                    # Render page as image (medium res is fine for embedding)
+                    pix = page.get_pixmap(dpi=150)
+                    img_bytes = pix.tobytes("jpg")
+                    
+                    # Get Visual Vector (Semantic)
+                    vector = get_visual_embedding(img_bytes)
+                    
+                    # Get Text Content (Keyword / Hybrid)
+                    # We extract the text layer so we can still find things by exact name/keyword!
+                    raw_text = page.get_text()
+                    if not raw_text.strip():
+                        raw_text = f"Page {i+1} of {os.path.basename(file_path)} (Image Only)"
+                    
+                    # Store as Chunk
+                    chunk_id = hashlib.md5(f"{source_id}_p{i}".encode()).hexdigest()
+                    
+                    query = """
+                    MERGE (c:Chunk {id: $id})
+                    SET c.text = $text,
+                        c.source = $source,
+                        c.page = $page,
+                        c.embedding = $vector,
+                        c.seq = $seq,
+                        c.last_updated = timestamp(),
+                        c.modality = 'hybrid_vision'
+                    """
+                    params = {
+                        "id": chunk_id,
+                        "text": raw_text,       # <-- KEYWORD SEARCH ENABLED
+                        "source": source_id,
+                        "page": i+1,
+                        "vector": vector,       # <-- VISION SEARCH ENABLED
+                        "seq": i
+                    }
+                    graph.query(query, params)
+                    
+                    # NEXT relationship
+                    if prev_chunk_id:
+                        graph.query("""
+                            MATCH (c1:Chunk {id: $prev}), (c2:Chunk {id: $curr})
+                            MERGE (c1)-[:NEXT]->(c2)
+                        """, {"prev": prev_chunk_id, "curr": chunk_id})
+                    
+                    prev_chunk_id = chunk_id
+                    
+                doc.close()
+                logger.info(f"   ✅ Processed {len(doc)} visual chunks.")
+                
+            except Exception as e:
+                logger.error(f"   ❌ Failed to process visual doc: {e}")
 
 
         for item in items:
             
             if "specs" in item: # It's a Car
-                # 1. Standard Graph Node
+                # Cars are mostly text/specs, keep standard graph logic
+                # But if we had an image url, we could download and embed it!
                 specs = item.get("specs", {})
                 flat_item = item.copy()
                 if "specs" in flat_item:
@@ -105,54 +151,24 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                 
                 props = {k: v for k, v in flat_item.items() if isinstance(v, (str, int, float, bool))}
                 
-                query = """
-                MERGE (c:Car {source_url: $url})
-                SET c += $props, c.last_updated = timestamp()
-                """
-                params = {"url": item.get("source_url"), "props": props}
-                graph.query(query, params=params)
-                
-                # 2. Vector Chunking (Description)
-                if item.get("description"):
-                    process_content_to_chunks(
-                        item.get("description"), 
-                        item.get("source_url"), 
-                        {"type": "car_description"}
-                    )
+                query = "MERGE (c:Car {source_url: $url}) SET c += $props"
+                graph.query(query, params={"url": item.get("source_url"), "props": props})
+                # Skip vectors for Cars in this MVP unless we crawl images.
 
             elif "type" in item and item["type"] == "pdf": # It's a Doc
                  # 1. Metadata Node 
-                 query = """
-                 MERGE (d:Document {file_id: $fid})
-                 SET d.filename = $fname, d.pages = $pages, d.last_updated = timestamp()
-                 """
-                 params = {
-                     "fid": item.get("file_id"),
-                     "fname": item.get("filename"),
-                     "pages": item.get("metadata", {}).get("pages")
-                 }
-                 graph.query(query, params=params)
+                 query = "MERGE (d:Document {file_id: $fid}) SET d.filename = $fname"
+                 graph.query(query, params={"fid": item.get("file_id"), "fname": item.get("filename")})
                  
-                 # 2. Vector Chunking (Full Content)
-                 process_content_to_chunks(
-                     item.get("content"), 
-                     item.get("filename"), 
-                     item.get("metadata", {})
-                 )
+                 # 2. VISION Processing (Pass file path)
+                 # DLT item['file_id'] is the absolute path in our resource definition
+                 process_doc_to_visual_chunks(item.get("file_id"), item.get("filename"))
             
             else: # Generic
                 label = item.get("class", "Entity")
-                identifier = item.get("id") or item.get("url") or item.get("name") or str(uuid.uuid4())
-                
-                query = f"MERGE (n:{label} {{id: $id}}) SET n += $props"
+                identifier = item.get("id") or item.get("url") or str(uuid.uuid4())
                 props = {k: v for k, v in item.items() if isinstance(v, (str, int, float, bool))}
-                graph.query(query, params={"id": identifier, "props": props})
-                
-                # If there's a big text field, chunk it?
-                # Heuristic: find longest string
-                long_text = max([v for v in item.values() if isinstance(v, str)], key=len, default="")
-                if len(long_text) > 100:
-                    process_content_to_chunks(long_text, identifier, {})
+                graph.query(f"MERGE (n:{label} {{id: $id}}) SET n += $props", params={"id": identifier, "props": props})
 
     except Exception as e:
         logger.error(f"Neo4j Sink Error: {e}")

@@ -11,7 +11,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from config import Config
+from config import Config
 from logger import setup_logger
+from router import get_route
 
 logger = setup_logger(__name__)
 
@@ -88,9 +90,12 @@ def retrieve_graph_context(graph, llm, question: str, limit: int = 15) -> str:
         logger.error(f"Graph search failed: {e}")
         return ""
 
-def vector_retrieve(graph, embeddings, question, k=10, min_score=0.5):
-    """Gets relevant text chunks using Vector Similarity."""
+def vector_retrieve(graph, embeddings, question, k=10, min_score=0.5, route="fast_fact"):
+    """Gets relevant text chunks using Vector Similarity. Boosts Vision chunks if Visual intent."""
     q_embedding = embeddings.embed_query(question)
+    
+    # Boost Visual Chunks if route is visual
+    visual_boost = 0.2 if route == "visual_layout" else 0.0
     
     result = graph.query("""
         CALL db.index.vector.queryNodes('chunk_vector_index', $k, $embedding)
@@ -104,10 +109,14 @@ def vector_retrieve(graph, embeddings, question, k=10, min_score=0.5):
         WITH node, score, prev, next
         WITH node, score, 
              coalesce(prev.text, '') + '\n--[Prev Chunk]--\n' + node.text + '\n--[Next Chunk]--\n' + coalesce(next.text, '') as full_context
-             
-        RETURN full_context AS text, node.source AS source, node.page AS page, score
-        ORDER BY score DESC
-    """, {"embedding": q_embedding, "k": k, "min_score": min_score})
+        
+        // Boost score for sorting if Visual Intent and Node is Vision
+        WITH node, score, full_context,
+             (score + CASE WHEN node.modality = 'vision' OR node.modality = 'hybrid_vision' THEN $boost ELSE 0 END) as final_score
+
+        RETURN full_context AS text, node.source AS source, node.page AS page, final_score as score
+        ORDER BY final_score DESC
+    """, {"embedding": q_embedding, "k": k, "min_score": min_score, "boost": visual_boost})
     
     return result
 
@@ -163,31 +172,35 @@ def reciprocal_rank_fusion(results_lists, k=60):
     reranked_results.sort(key=lambda x: x['rrf_score'], reverse=True)
     return reranked_results
 
-def hybrid_context(graph, embeddings, question, llm_model):
-    """Combines Graph, Vector, and Keyword context."""
+def hybrid_context(graph, embeddings, question, llm_model, route="fast_fact"):
+    """Combines Graph, Vector, and Keyword context. Adapts to Route."""
     create_fulltext_index(graph)
     create_chunk_fulltext_index(graph)
     
-    # 1. GRAPH SEARCH
-    graph_ctx = retrieve_graph_context(graph, llm_model, question)
+    # 1. GRAPH SEARCH (Boosted if deep_reasoning)
+    graph_limit = 30 if route == "deep_reasoning" else 15
+    graph_ctx = retrieve_graph_context(graph, llm_model, question, limit=graph_limit)
 
     # 2. HYBRID SEARCH
     keyword_ctx = keyword_retrieve(graph, question, k=5)
     
     # Vector Search (Multi-Query)
     queries_to_run = [question]
-    try:
-        if len(question) > 10 and llm_model:
-             alt_prompt = f"Generate 2 alternative search queries for: '{question}'. Return only comma-separated strings."
-             alt_resp = llm_model.invoke(alt_prompt).content
-             alts = [q.strip() for q in alt_resp.split(',') if q.strip()]
-             queries_to_run.extend(alts[:2])
-    except Exception as e:
-        logger.warning(f"Multi-query generation failed: {e}")
+    # Only multi-query if NOT visual (visual needs precise single query usually)
+    if route != "visual_layout":
+        try:
+            if len(question) > 10 and llm_model:
+                 alt_prompt = f"Generate 2 alternative search queries for: '{question}'. Return only comma-separated strings."
+                 alt_resp = llm_model.invoke(alt_prompt).content
+                 alts = [q.strip() for q in alt_resp.split(',') if q.strip()]
+                 queries_to_run.extend(alts[:2])
+        except Exception as e:
+            logger.warning(f"Multi-query generation failed: {e}")
 
     vector_results_map = {}
     for q in queries_to_run:
-        res = vector_retrieve(graph, embeddings, q, k=10, min_score=0.50)
+        # Pass route to vector_retrieve for boosting
+        res = vector_retrieve(graph, embeddings, q, k=10, min_score=0.50, route=route)
         for r in res:
             vector_results_map[r['text']] = r 
             
@@ -338,16 +351,25 @@ def answer(question, history="", temperature=0.3):
         standalone_question = dynamic_llm.invoke(condense_prompt.format(history=history, question=question)).content
         logger.info(f"Rewritten: {standalone_question}")
 
-    context = hybrid_context(graph, embeddings, standalone_question, llm_model=dynamic_llm)
+    # --- ROUTER STEP ---
+    route = get_route(standalone_question)
+    logger.info(f"🚀 Query Route: {route}")
+
+    context = hybrid_context(graph, embeddings, standalone_question, llm_model=dynamic_llm, route=route)
     
-    template = """You are an intelligent AI assistant.
+    template = """You are an intelligent Thai AI assistant (Hybrid RAG).
 Answer based ONLY on context: {context}
 History: {history}
 Question: {question}
+
+Route Detected: {route}
+
 Rules:
-- Answer in same language.
-- Use Tables for specs.
-- Mention Images if found.
+- ANSWER IN THAI LANGUAGE ONLY (Respond properly with 'ครับ' or 'ค่ะ').
+- If 'Visual' intent, describe the table/chart details clearly.
+- If 'Deep Reasoning', explain the 'Why' and 'How'.
+- Cite the source page (e.g. [Page 5]).
+- Be polite and professional.
 """
     prompt = ChatPromptTemplate.from_template(template)
     final_chain = (prompt | dynamic_llm | StrOutputParser())
@@ -355,7 +377,8 @@ Rules:
     response = final_chain.invoke({
         "history": history,
         "context": context,
-        "question": standalone_question
+        "question": standalone_question,
+        "route": route
     })
     
     return {"result": response, "context": context}

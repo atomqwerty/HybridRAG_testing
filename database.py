@@ -33,6 +33,10 @@ def create_vector_index(graph, dimensions=3072):
     
     # 1. Chunk Index
     try:
+        # Check if index exists first? Neo4j 5.x IF NOT EXISTS works well.
+        # But if dimension changes, we might need to drop and recreate.
+        # For now, we assume user cleans DB if switching models.
+        
         graph.query(f"""
         CREATE VECTOR INDEX chunk_vector_index IF NOT EXISTS
         FOR (c:Chunk) ON (c.embedding)
