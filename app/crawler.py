@@ -29,7 +29,7 @@ DEFAULTS = {
 def get_crawler_rules():
     """Loads dynamic brands/keywords from JSON, falls back to defaults."""
     try:
-        config_path = Path("data/source_config.json")
+        config_path = Path("source_config.json")
         if config_path.exists():
             with open(config_path, "r") as f:
                 data = json.load(f)
@@ -264,10 +264,13 @@ def load_web_with_images(url):
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument(f"user-agent={Config.USER_AGENT}")
     
+    print(f"DEBUG: Initializing Chrome Driver for {url}")
     try:
-        # Access system-installed chromedriver directly
-        service = Service(executable_path="/usr/bin/chromedriver")
+        from webdriver_manager.chrome import ChromeDriverManager
+        service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=chrome_options)
+        print("DEBUG: Driver initialized")
+
         
         try:
             driver.get(url)
@@ -331,7 +334,7 @@ def load_web_with_images(url):
                     suffix = '.jpg'
                     
                 img_filename = f"web_{uuid.uuid4().hex[:8]}{suffix}"
-                save_dir = Path("data/extracted_images")
+                save_dir = Path(Config.DATA_DIR) / "extracted_images"
                 save_dir.mkdir(parents=True, exist_ok=True)
                 img_path = save_dir / img_filename
                 

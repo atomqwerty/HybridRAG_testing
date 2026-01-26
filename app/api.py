@@ -300,7 +300,7 @@ def run_ingestion_background():
     
     # Reset status synchronously to prevent UI race conditions
     try:
-        with open(os.path.join(Config.DATA_DIR, "ingest_status.json"), "w") as f:
+        with open(os.path.join(Config.BASE_DIR, "ingest_status.json"), "w") as f:
             json.dump({"percent": 0, "message": "Starting...", "status": "running"}, f)
     except: pass
 
@@ -313,20 +313,20 @@ def run_ingestion_background():
                 logger.info("Ingestion Complete!")
                 # Update status file to 100%
                 try:
-                    with open(os.path.join(Config.DATA_DIR, "ingest_status.json"), "w") as f:
+                    with open(os.path.join(Config.BASE_DIR, "ingest_status.json"), "w") as f:
                         json.dump({"percent": 100, "message": "Done!", "status": "completed"}, f)
                 except: pass
             else:
                 logger.error(f"Ingestion Failed: {result.stderr}")
                 try:
-                    with open(os.path.join(Config.DATA_DIR, "ingest_status.json"), "w") as f:
+                    with open(os.path.join(Config.BASE_DIR, "ingest_status.json"), "w") as f:
                         # Capture more of the error (500 chars) for debugging
                         json.dump({"percent": 0, "message": f"Failed: {result.stderr[:500]}", "status": "error"}, f)
                 except: pass
         except Exception as e:
             logger.error(f"Ingestion Error: {e}")
             try:
-                with open(os.path.join(Config.DATA_DIR, "ingest_status.json"), "w") as f:
+                with open(os.path.join(Config.BASE_DIR, "ingest_status.json"), "w") as f:
                     json.dump({"percent": 0, "message": str(e), "status": "error"}, f)
             except: pass
     threading.Thread(target=_run).start()
@@ -409,7 +409,7 @@ def upload_file_source():
 @app.route('/api/ingest/status', methods=['GET'])
 def get_ingest_status():
     try:
-        path = os.path.join(Config.DATA_DIR, "ingest_status.json")
+        path = os.path.join(Config.BASE_DIR, "ingest_status.json")
         if os.path.exists(path):
             with open(path, "r") as f: return jsonify(json.load(f))
         return jsonify({"status": "idle", "percent": 0, "message": "Ready"})

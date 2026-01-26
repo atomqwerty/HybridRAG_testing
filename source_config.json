@@ -1,0 +1,36 @@
+{
+    "default_score": 0.5,
+    "rules": [
+        {
+            "pattern": "PrivacyPolicyEleXA.pdf",
+            "score": 1.0,
+            "type": "file"
+        },
+        {
+            "pattern": "ev-charging-station-elexa-by-egat-2021.pdf",
+            "score": 1.0,
+            "type": "file"
+        },
+        {
+            "pattern": "urls.txt",
+            "score": 1.0,
+            "type": "file"
+        },
+        {
+            "pattern": "ananindustry.com",
+            "score": 1.0,
+            "type": "domain"
+        },
+        {
+            "pattern": "test-trigger.com",
+            "score": 1.0,
+            "type": "domain"
+        },
+        {
+            "pattern": "test-trigger-2.com",
+            "score": 1.0,
+            "type": "domain"
+        }
+    ],
+    "strict_mode": true
+}

@@ -12,6 +12,7 @@ from crawler import load_web_with_images
 from logger import setup_logger
 
 logger = setup_logger(__name__)
+from utils import update_status, auto_add_trust_rule
 
 from langchain_core.documents import Document
 from database import create_vector_index
@@ -170,8 +171,49 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                 props = {k: v for k, v in item.items() if isinstance(v, (str, int, float, bool))}
                 graph.query(f"MERGE (n:{label} {{id: $id}}) SET n += $props", params={"id": identifier, "props": props})
 
+
     except Exception as e:
         logger.error(f"Neo4j Sink Error: {e}")
+
+@dlt.resource(name="hybrid_rag_data", write_disposition="replace")
+def hybrid_rag_source(urls: list, files: list):
+    """
+    DLT Resource that yields data from both Files and URLs.
+    """
+    # 1. Yield Files (Metadata only, heavy processing in Sink)
+    for file_path in files:
+        yield {
+            "type": "pdf" if file_path.endswith(".pdf") else "file",
+            "file_id": file_path,
+            "filename": os.path.basename(file_path),
+            "source_type": "filesystem"
+        }
+        
+    # 2. Yield URLs (Scraped Content)
+    for url in urls:
+        try:
+            print(f"DEBUG: Starting processing for URL: {url}")
+            # Check if it's a placeholder
+            if "example.com" in url: 
+                print(f"DEBUG: Skipping placeholder {url}")
+                continue
+            
+            print(f"DEBUG: Calling load_web_with_images for {url}")
+            docs = load_web_with_images(url)
+            print(f"DEBUG: Received {len(docs)} docs from {url}")
+            
+            for doc in docs:
+                yield {
+                    "type": "web",
+                    "url": url,
+                    "content": doc.page_content,
+                    "metadata": doc.metadata,
+                    "source_type": "web"
+                }
+        except Exception as e:
+            print(f"DEBUG: Error processing {url}: {e}")
+            logger.error(f"Failed to yield URL {url}: {e}")
+
 
 
 if __name__ == "__main__":

@@ -26,11 +26,11 @@ class Config:
     USER_AGENT = os.getenv('USER_AGENT', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
     
     # Paths
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     DATA_DIR = os.path.join(BASE_DIR, 'data')
     LOG_DIR = os.path.join(BASE_DIR, 'log')
     SESSION_FILE = os.path.join(DATA_DIR, 'chat_sessions.json')
-    TRUST_CONFIG_FILE = os.path.join(DATA_DIR, 'source_config.json')
+    TRUST_CONFIG_FILE = os.path.join(BASE_DIR, 'source_config.json')
 
     # --- Vision RAG (ColiVara) ---
     COLIVARA_API_URL = os.getenv("COLIVARA_API_URL", "http://localhost:8000/runsync")
