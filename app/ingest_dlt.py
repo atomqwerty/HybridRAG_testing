@@ -21,6 +21,44 @@ import fitz # PyMuPDF
 import base64
 import requests
 from io import BytesIO
+from langchain_openai import ChatOpenAI
+from langchain_experimental.graph_transformers import LLMGraphTransformer
+from langchain_core.documents import Document
+
+
+# --- Graph Helpers ---
+def clean_graph_schema(graph):
+    """Merges duplicate entities."""
+    logger.info("Cleaning and Consolidating Graph Schema...")
+    try:
+        graph.query("""
+            MATCH (n:Entity)
+            WITH toLower(n.id) as id, collect(n) as nodes
+            WHERE size(nodes) > 1
+            CALL apoc.refactor.mergeNodes(nodes, {properties: 'combine', mergeRels: true})
+            YIELD node
+            RETURN count(node)
+        """)
+        logger.info("Merged duplicate entities.")
+    except Exception as e:
+        logger.warning(f"APOC Merge failed: {e}")
+
+    try:
+        graph.query("MATCH (n:Entity) WHERE NOT (n)--() DELETE n")
+        logger.info("Removed orphan entities.")
+    except Exception as e:
+        logger.warning(f"Failed to remove orphans: {e}")
+
+def enrich_communities(graph):
+    logger.info("Detecting Communities (GDS Louvain)...")
+    try:
+        graph.query("CALL gds.graph.project('communityGraph', 'Entity', '*')")
+        graph.query("CALL gds.louvain.write('communityGraph', { writeProperty: 'communityId' })")
+        graph.query("CALL gds.graph.drop('communityGraph') YIELD graphName")
+        graph.query("CREATE INDEX community_id_index IF NOT EXISTS FOR (n:Entity) ON (n.communityId)")
+        logger.info("Community detection complete.")
+    except Exception as e:
+        logger.warning(f"GDS Community Detection failed: {e}")
 
 # --- Neo4j Sink ---
 def load_to_neo4j(items: Iterator[Dict[str, Any]]):
@@ -133,18 +171,39 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                     
                     prev_chunk_id = chunk_id
                     
+                num_pages = len(doc)
                 doc.close()
-                logger.info(f"   ✅ Processed {len(doc)} visual chunks.")
+                logger.info(f"   ✅ Processed {num_pages} visual chunks.")
                 
             except Exception as e:
                 logger.error(f"   ❌ Failed to process visual doc: {e}")
 
 
+        # Initialize LLM for Graph Extraction
+        llm = ChatOpenAI(
+            api_key=Config.OPENAI_API_KEY,
+            base_url=Config.OPENAI_BASE_URL,
+            model=Config.OPENAI_MODEL,
+            temperature=0
+        )
+        
+        # Default Schema
+        allowed_nodes = ["Person", "Organization", "Event", "Location", "Product", "Service"]
+        allowed_rels = ["WORKS_FOR", "LOCATED_AT", "PARTICIPATED_IN", "CREATED", "OFFERS"]
+        
+        llm_transformer = LLMGraphTransformer(
+            llm=llm,
+            allowed_nodes=allowed_nodes,
+            allowed_relationships=allowed_rels
+        )
+
         for item in items:
+            if not isinstance(item, dict):
+                logger.warning(f"Skipping malformed item (expected dict, got {type(item)}): {item}")
+                continue
             
             if "specs" in item: # It's a Car
                 # Cars are mostly text/specs, keep standard graph logic
-                # But if we had an image url, we could download and embed it!
                 specs = item.get("specs", {})
                 flat_item = item.copy()
                 if "specs" in flat_item:
@@ -154,7 +213,6 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                 
                 query = "MERGE (c:Car {source_url: $url}) SET c += $props"
                 graph.query(query, params={"url": item.get("source_url"), "props": props})
-                # Skip vectors for Cars in this MVP unless we crawl images.
 
             elif "type" in item and item["type"] == "pdf": # It's a Doc
                  # 1. Metadata Node 
@@ -162,14 +220,27 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                  graph.query(query, params={"fid": item.get("file_id"), "fname": item.get("filename")})
                  
                  # 2. VISION Processing (Pass file path)
-                 # DLT item['file_id'] is the absolute path in our resource definition
                  process_doc_to_visual_chunks(item.get("file_id"), item.get("filename"))
             
-            else: # Generic
+            else: # Generic (Web or Text)
                 label = item.get("class", "Entity")
                 identifier = item.get("id") or item.get("url") or str(uuid.uuid4())
                 props = {k: v for k, v in item.items() if isinstance(v, (str, int, float, bool))}
+                
+                # 1. Standard Vector/Chunk Node
                 graph.query(f"MERGE (n:{label} {{id: $id}}) SET n += $props", params={"id": identifier, "props": props})
+                
+                # 2. ULTIMATE HYBRID: Extract Knowledge Graph
+                if "content" in item:
+                    try:
+                        logger.info(f"   🧠 Extracting Knowledge Graph for {identifier}...")
+                        doc = Document(page_content=item['content'], metadata={"source": identifier})
+                        graph_docs = llm_transformer.convert_to_graph_documents([doc])
+                        if graph_docs:
+                            graph.add_graph_documents(graph_docs)
+                            logger.info(f"   ✅ Extracted {len(graph_docs[0].nodes)} entities and {len(graph_docs[0].relationships)} relationships.")
+                    except Exception as e:
+                        logger.warning(f"Graph extraction failed for {identifier}: {e}")
 
 
     except Exception as e:
@@ -266,14 +337,19 @@ if __name__ == "__main__":
     
     data = list(hybrid_rag_source(target_urls, target_files)) 
     
-    all_items = []
-    for gen in data:
-        all_items.extend(list(gen))
+    all_items = data
         
     load_to_neo4j(all_items)
-    print("✅ Neo4j Sync Complete.")
     
-    # 3. Pydantic Validation
+    # 3. ULTIMATE HYBRID: Post-Processing
+    print("Running Graph Enrichment...")
+    graph = Neo4jGraph(url=Config.NEO4J_URI, username=Config.NEO4J_USERNAME, password=Config.NEO4J_PASSWORD)
+    clean_graph_schema(graph)
+    enrich_communities(graph)
+    
+    print("✅ Neo4j Sync & Enrichment Complete.")
+    
+    # 4. Pydantic Validation
     update_status("Validating Data Structure...", 90)
     # ... (Validation Logic) ...
     try:

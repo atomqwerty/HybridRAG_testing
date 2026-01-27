@@ -5,7 +5,7 @@ from logger import setup_logger
 
 logger = setup_logger(__name__)
 
-def update_status(percent, message):
+def update_status(message, percent, status=None):
     """
     Updates the ingestion status to a JSON file.
     """
@@ -15,7 +15,8 @@ def update_status(percent, message):
         except:
             percent = 0
             
-        status = "running" if percent < 100 else "completed"
+        if status is None:
+            status = "running" if percent < 100 else "completed"
         # Ensure data directory exists
         
         with open(os.path.join(Config.BASE_DIR, "ingest_status.json"), "w") as f:
