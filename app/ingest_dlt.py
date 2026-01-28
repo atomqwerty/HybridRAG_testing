@@ -8,21 +8,23 @@ import uuid
 import os
 import glob
 from langchain_community.graphs import Neo4jGraph
-from crawler import load_web_with_images
+from crawler import load_web_with_images, get_internal_links
 from logger import setup_logger
 
 logger = setup_logger(__name__)
 from utils import update_status, auto_add_trust_rule
+from mineru_utils import extract_pdf_content_mineru
 
 from langchain_core.documents import Document
-from database import create_vector_index
+from database import create_vector_index, create_text_vector_index
 import hashlib
 import fitz # PyMuPDF
 import base64
 import requests
 from io import BytesIO
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_experimental.graph_transformers import LLMGraphTransformer
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
 
@@ -77,44 +79,113 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
         # ColPali/ColQwen usually has 128 dim (per token). 
         # If we use pooled, we need to know. For now assuming 128 based on Config.
         create_vector_index(graph, dimensions=Config.EMBEDDING_DIMENSION)
+        create_text_vector_index(graph, dimensions=3072)
         
         def get_visual_embedding(image_bytes):
-            """Calls local ColiVara API"""
-            try:
-                # Based on ColiVarE API spec: POST /runsync
-                # Payload: {"input": {"task": "embed", "input_data": ["base64_string"]}}
-                # Note: Check actual API spec. The README said: "input_data": ["hello"] for text.
-                # For images, we likely need base64.
-                
-                b64_str = base64.b64encode(image_bytes).decode('utf-8')
-                
-                # Payload structure assumption based on standard serverless-style APIs
-                # Adjust if ColiVara differs.
-                payload = {
-                    "input": {
-                        "task": "embed", # or "embed_image"?
-                        "input_data": [b64_str],
-                        "modality": "image" # Hypothetical flag
-                    }
-                }
-                
-                # ColiVarE likely expects a list of inputs.
-                # If it's a general VLM, we pass the image.
-                
-                res = requests.post(Config.COLIVARA_API_URL, json=payload, timeout=30)
-                if res.status_code == 200:
-                    # Parse response. Expecting list of vectors.
-                    # response format?? {"output": [[0.1, ...]]}
-                    data = res.json()
-                    return data.get("output", [])[0]
-                else:
-                    logger.error(f"ColiVara API Error: {res.text}")
-                    return [0.0] * Config.EMBEDDING_DIMENSION
-                    
-            except Exception as e:
-                logger.error(f"Visual Embed Failed: {e}")
-                return [0.0] * Config.EMBEDDING_DIMENSION
+            """Returns placeholder visual embedding."""
+            # To enable real visual search, install a local VLM/CLIP model here.
+            # For now, we rely on MinerU Text Search to find the image.
+            return [0.0] * Config.EMBEDDING_DIMENSION
 
+        # Initialize Text Embedding (for MinerU chunks)
+        text_embeddings = OpenAIEmbeddings(
+            model=Config.OPENAI_EMBEDDING_MODEL,
+            api_key=Config.OPENAI_API_KEY,
+            base_url=Config.OPENAI_BASE_URL
+        )
+
+        # Initialize LLM for Graph Extraction (Moved up for MinerU access)
+        llm = ChatOpenAI(
+            api_key=Config.OPENAI_API_KEY,
+            base_url=Config.OPENAI_BASE_URL,
+            model=Config.OPENAI_MODEL,
+            temperature=0
+        )
+        
+        # Default Schema
+        allowed_nodes = ["Person", "Organization", "Event", "Location", "Product", "Service"]
+        allowed_rels = ["WORKS_FOR", "LOCATED_AT", "PARTICIPATED_IN", "CREATED", "OFFERS"]
+        
+        llm_transformer = LLMGraphTransformer(
+            llm=llm,
+            allowed_nodes=allowed_nodes,
+            allowed_relationships=allowed_rels
+        )
+
+        def process_doc_mineru(file_path, source_id):
+            """Uses MinerU to extract high-quality text, chunk, and embed."""
+            content = extract_pdf_content_mineru(file_path)
+            if not content: return
+
+            logger.info(f"   🧠 MinerU: Chunking & Embedding content for {source_id}...")
+            
+            # Chunking
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            chunks = splitter.create_documents([content])
+            
+            prev_chunk_id = None
+            
+            for i, chunk in enumerate(chunks):
+                chunk_text = chunk.page_content
+                chunk_id = hashlib.md5(f"{source_id}_mineru_{i}".encode()).hexdigest()
+                
+                # Embed Text
+                try:
+                    vector = text_embeddings.embed_query(chunk_text)
+                except Exception as e:
+                    logger.warning(f"Embedding failed for chunk {i}: {e}")
+                    vector = [0.0] * 3072 # Fallback size, check model
+
+                # Write to Neo4j
+                query = """
+                MERGE (c:Chunk {id: $id})
+                SET c.text = $text,
+                    c.source = $source,
+                    c.seq = $seq,
+                    c.text_embedding = $vector,
+                    c.modality = 'mineru_text',
+                    c.extraction = 'mineru',
+                    c.page = 1,
+                    c.image_path = $image_path
+                """
+                # Note: If Vector Index is shared, dimensions must match. 
+                # Visual (128?) vs Text (1536/3072?). 
+                # Ideally we use separate indices or projection. 
+                # For now, we assume simple Hybrid (retrieval filters by modality or uses separate search).
+                
+                graph.query(query, {
+                    "id": chunk_id,
+                    "text": chunk_text,
+                    "source": source_id,
+                    "seq": i,
+                    "vector": vector,
+                    # Fallback to display the first page image for generic text hits
+                    "image_path": f"{source_id}_p0.jpg" 
+                })
+                
+                if prev_chunk_id:
+                     graph.query("""
+                        MATCH (c1:Chunk {id: $prev}), (c2:Chunk {id: $curr})
+                        MERGE (c1)-[:NEXT]->(c2)
+                    """, {"prev": prev_chunk_id, "curr": chunk_id})
+                
+                prev_chunk_id = chunk_id
+            
+            logger.info(f"   ✅ MinerU: Created {len(chunks)} text chunks.")
+            
+            # --- ULTIMATE HYBRID: Knowledge Graph from MinerU Text ---
+            try:
+                logger.info(f"   🧠 MinerU: Extracting Knowledge Graph entities...")
+                # We reuse the chunks created above
+                # Add metadata for graph ref
+                for c in chunks: c.metadata = {"source": source_id}
+                
+                graph_docs = llm_transformer.convert_to_graph_documents(chunks)
+                if graph_docs:
+                    graph.add_graph_documents(graph_docs)
+                    logger.info(f"   ✅ MinerU: Extracted {len(graph_docs[0].nodes)} entities from PDF text.")
+            except Exception as e:
+                logger.warning(f"MinerU Graph Extraction failed: {e}")
         def process_doc_to_visual_chunks(file_path, source_id, metadata={}):
             """Renders PDF pages as images and embeds them."""
             if not os.path.exists(file_path): return
@@ -129,6 +200,14 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                     # Render page as image (medium res is fine for embedding)
                     pix = page.get_pixmap(dpi=150)
                     img_bytes = pix.tobytes("jpg")
+                    
+                    # SAVE IMAGE TO DISK (for UI display)
+                    img_filename = f"{source_id}_p{i}.jpg"
+                    save_dir = os.path.join(Config.DATA_DIR, "extracted_images")
+                    os.makedirs(save_dir, exist_ok=True)
+                    img_path = os.path.join(save_dir, img_filename)
+                    with open(img_path, "wb") as f:
+                        f.write(img_bytes)
                     
                     # Get Visual Vector (Semantic)
                     vector = get_visual_embedding(img_bytes)
@@ -148,6 +227,7 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                         c.source = $source,
                         c.page = $page,
                         c.embedding = $vector,
+                        c.image_path = $image_path,
                         c.seq = $seq,
                         c.last_updated = timestamp(),
                         c.modality = 'hybrid_vision'
@@ -158,6 +238,7 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                         "source": source_id,
                         "page": i+1,
                         "vector": vector,       # <-- VISION SEARCH ENABLED
+                        "image_path": img_filename, # Store filename relative to DATA_DIR or extracted_images
                         "seq": i
                     }
                     graph.query(query, params)
@@ -179,23 +260,7 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                 logger.error(f"   ❌ Failed to process visual doc: {e}")
 
 
-        # Initialize LLM for Graph Extraction
-        llm = ChatOpenAI(
-            api_key=Config.OPENAI_API_KEY,
-            base_url=Config.OPENAI_BASE_URL,
-            model=Config.OPENAI_MODEL,
-            temperature=0
-        )
-        
-        # Default Schema
-        allowed_nodes = ["Person", "Organization", "Event", "Location", "Product", "Service"]
-        allowed_rels = ["WORKS_FOR", "LOCATED_AT", "PARTICIPATED_IN", "CREATED", "OFFERS"]
-        
-        llm_transformer = LLMGraphTransformer(
-            llm=llm,
-            allowed_nodes=allowed_nodes,
-            allowed_relationships=allowed_rels
-        )
+
 
         for item in items:
             if not isinstance(item, dict):
@@ -221,6 +286,9 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                  
                  # 2. VISION Processing (Pass file path)
                  process_doc_to_visual_chunks(item.get("file_id"), item.get("filename"))
+                 
+                 # 3. MinerU Processing (High Quality Text)
+                 process_doc_mineru(item.get("file_id"), item.get("filename"))
             
             else: # Generic (Web or Text)
                 label = item.get("class", "Entity")
@@ -230,15 +298,58 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                 # 1. Standard Vector/Chunk Node
                 graph.query(f"MERGE (n:{label} {{id: $id}}) SET n += $props", params={"id": identifier, "props": props})
                 
-                # 2. ULTIMATE HYBRID: Extract Knowledge Graph
+                # 2. ULTIMATE HYBRID: Chunk & Embed (For Vector Search)
                 if "content" in item:
+                    try:
+                        logger.info(f"   🧠 Vectorizing Content for {identifier}...")
+                        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                        chunks = splitter.create_documents([item['content']])
+                        
+                        for i, chunk in enumerate(chunks):
+                            chunk_text = chunk.page_content
+                            chunk_id = hashlib.md5(f"{identifier}_web_{i}".encode()).hexdigest()
+                            
+                            try:
+                                vector = text_embeddings.embed_query(chunk_text)
+                            except:
+                                vector = [0.0] * 3072
+
+                            # Write Web Chunk
+                            chunk_query = """
+                            MERGE (c:Chunk {id: $id})
+                            SET c.text = $text,
+                                c.source = $source,
+                                c.seq = $seq,
+                                c.text_embedding = $vector,
+                                c.modality = 'web_text',
+                                c.page = 1,
+                                c.image_path = $image_path 
+                            """
+                            # Use a default image if available (from metadata?) or placeholder
+                            img_path = item.get("metadata", {}).get("image_path", "default.jpg") 
+                            
+                            graph.query(chunk_query, {
+                                "id": chunk_id,
+                                "text": chunk_text,
+                                "source": identifier,
+                                "seq": i,
+                                "vector": vector,
+                                "image_path": img_path
+                            })
+
+                        logger.info(f"   ✅ Created {len(chunks)} vector chunks for {identifier}.")
+
+                    except Exception as e:
+                        logger.warning(f"Vectorization failed for {identifier}: {e}")
+
+                    # 3. Knowledge Graph Extraction
                     try:
                         logger.info(f"   🧠 Extracting Knowledge Graph for {identifier}...")
                         doc = Document(page_content=item['content'], metadata={"source": identifier})
                         graph_docs = llm_transformer.convert_to_graph_documents([doc])
                         if graph_docs:
                             graph.add_graph_documents(graph_docs)
-                            logger.info(f"   ✅ Extracted {len(graph_docs[0].nodes)} entities and {len(graph_docs[0].relationships)} relationships.")
+                            logger.info(f"   ✅ Extracted KG: {len(graph_docs[0].nodes)} nodes.")
                     except Exception as e:
                         logger.warning(f"Graph extraction failed for {identifier}: {e}")
 
@@ -269,18 +380,32 @@ def hybrid_rag_source(urls: list, files: list):
                 print(f"DEBUG: Skipping placeholder {url}")
                 continue
             
-            print(f"DEBUG: Calling load_web_with_images for {url}")
-            docs = load_web_with_images(url)
-            print(f"DEBUG: Received {len(docs)} docs from {url}")
+            print(f"DEBUG: deep crawling for {url}...")
+            # 1. Discover Sub-pages (Crawl)
+            sub_urls = get_internal_links(url, max_links=50) # Limit to 50 pages for speed
+            all_urls = [url] + sub_urls
+            # Remove duplicates
+            all_urls = list(set(all_urls))
             
-            for doc in docs:
-                yield {
-                    "type": "web",
-                    "url": url,
-                    "content": doc.page_content,
-                    "metadata": doc.metadata,
-                    "source_type": "web"
-                }
+            print(f"DEBUG: Found {len(all_urls)} pages to scrape for {url}")
+            
+            for page_url in all_urls:
+                try:
+                    print(f"DEBUG: Calling load_web_with_images for {page_url}")
+                    docs = load_web_with_images(page_url)
+                    print(f"DEBUG: Received {len(docs)} docs from {page_url}")
+                    
+                    for doc in docs:
+                        yield {
+                            "type": "web",
+                            "url": page_url,
+                            "content": doc.page_content,
+                            "metadata": doc.metadata,
+                            "source_type": "web"
+                        }
+                except Exception as e:
+                     print(f"DEBUG: Error processing page {page_url}: {e}")
+                     continue
         except Exception as e:
             print(f"DEBUG: Error processing {url}: {e}")
             logger.error(f"Failed to yield URL {url}: {e}")
@@ -295,7 +420,8 @@ if __name__ == "__main__":
     prod_urls = []
     if os.path.exists(urls_file):
         with open(urls_file, "r") as f:
-            prod_urls = [line.strip() for line in f if line.strip()]
+            # Defensive dedup: set() removes duplicates immediately
+            prod_urls = list({line.strip() for line in f if line.strip()})
     
     prod_files = []
     search_patterns = ["**/*.pdf", "**/*.docx", "**/*.txt"]
@@ -303,7 +429,7 @@ if __name__ == "__main__":
         full_pattern = os.path.join(Config.DATA_DIR, pattern)
         prod_files.extend(glob.glob(full_pattern, recursive=True))
     
-    prod_files = [f for f in prod_files if "dlt_output" not in f]
+    prod_files = [f for f in prod_files if "dlt_output" not in f and "urls.txt" not in os.path.basename(f)]
 
     msg = f"Loaded {len(prod_urls)} URLs and {len(prod_files)} Files."
     print(msg)

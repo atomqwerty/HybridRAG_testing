@@ -49,6 +49,24 @@ def create_vector_index(graph, dimensions=3072):
     except Exception as e:
         print(f"   ⚠️ Could not create vector index: {e}")
 
+def create_text_vector_index(graph, dimensions=3072):
+    """
+    Creates a secondary vector index for usage with MinerU/Text embeddings.
+    """
+    print(f"   Using text embedding dimension: {dimensions}")
+    try:
+        graph.query(f"""
+        CREATE VECTOR INDEX text_vector_index IF NOT EXISTS
+        FOR (c:Chunk) ON (c.text_embedding)
+        OPTIONS {{indexConfig: {{
+            `vector.dimensions`: {dimensions},
+            `vector.similarity_function`: 'cosine'
+        }}}}
+        """)
+        print("   ✅ Vector index 'text_vector_index' ensured.")
+    except Exception as e:
+        print(f"   ⚠️ Could not create text vector index: {e}")
+
 def create_fulltext_index(graph):
     """
     Creates fulltext indexes for Entity nodes for better keyword search.

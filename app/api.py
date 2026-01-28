@@ -21,7 +21,7 @@ from database import get_db_connection, create_vector_index
 # Setup Logger
 logger = setup_logger(__name__)
 
-app = Flask(__name__, static_folder='frontend/build', static_url_path='/')
+app = Flask(__name__, static_folder=os.path.join(Config.BASE_DIR, 'frontend/build'), static_url_path='/')
 CORS(app)  # Enable CORS for React frontend
 
 # Initialize Persistence
@@ -132,9 +132,12 @@ def chat():
                     norm_path = img_p.replace('\\', '/')
                     if 'data/' in norm_path:
                         rel_path = norm_path.split('data/')[-1]
+                        # Remove leading slash
+                        if rel_path.startswith('/'): rel_path = rel_path[1:]
                     else:
                         rel_path = os.path.basename(norm_path)
-                        if 'web_' in rel_path or 'extracted_' in rel_path:
+                        # Only append subdir if not already present
+                        if ('web_' in rel_path or 'extracted_' in rel_path) and 'extracted_images' not in rel_path:
                             rel_path = f"extracted_images/{rel_path}"
                     final_images.append(rel_path)
             
@@ -193,7 +196,16 @@ def serve_static(path):
 def serve_image(filename):
     if filename.startswith('data/'):
         filename = filename[5:]
-    return send_from_directory(Config.DATA_DIR, filename)
+        
+    # direct path
+    if os.path.exists(os.path.join(Config.DATA_DIR, filename)):
+        return send_from_directory(Config.DATA_DIR, filename)
+        
+    # fallback: check extracted_images
+    if os.path.exists(os.path.join(Config.DATA_DIR, 'extracted_images', filename)):
+         return send_from_directory(os.path.join(Config.DATA_DIR, 'extracted_images'), filename)
+         
+    return "Image not found", 404
 
 # --- Frontend Process Management ---
 frontend_process = None
@@ -239,7 +251,8 @@ def delete_source_data():
             
         logger.info(f"Purging data for source pattern: {pattern}")
         
-        from run_qa import graph
+        from run_qa import get_graph
+        graph = get_graph()
         q1 = "MATCH (n:Chunk) WHERE n.source CONTAINS $pattern DETACH DELETE n"
         graph.query(q1, {"pattern": pattern})
         
@@ -281,7 +294,8 @@ def delete_source_data():
 @app.route('/api/files', methods=['GET'])
 def list_files():
     try:
-        from run_qa import graph
+        from run_qa import get_graph
+        graph = get_graph()
         query = """
         MATCH (n:Chunk) 
         WHERE n.source ENDS WITH '.pdf' OR n.source ENDS WITH '.PDF'
@@ -308,8 +322,26 @@ def run_ingestion_background():
         logger.info("Starting Ingestion Process (DLT Pipeline)...")
         try:
             # TRIGGER THE NEW DLT PIPELINE
-            result = subprocess.run([sys.executable, "ingest_dlt.py"], cwd=os.getcwd(), capture_output=True, text=True)
-            if result.returncode == 0:
+            # TRIGGER THE NEW DLT PIPELINE
+            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ingest_dlt.py")
+            
+            # Use Popen to stream output in real-time
+            process = subprocess.Popen(
+                [sys.executable, script_path], 
+                cwd=os.getcwd(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, # Merge stderr into stdout
+                text=True,
+                bufsize=1 # Line buffered
+            )
+            
+            # Stream logs
+            for line in process.stdout:
+                print(f"[IngestDLT] {line.strip()}", flush=True) # Print to Docker logs directly
+            
+            process.wait()
+            
+            if process.returncode == 0:
                 logger.info("Ingestion Complete!")
                 # Update status file to 100%
                 try:
@@ -317,11 +349,10 @@ def run_ingestion_background():
                         json.dump({"percent": 100, "message": "Done!", "status": "completed"}, f)
                 except: pass
             else:
-                logger.error(f"Ingestion Failed: {result.stderr}")
+                logger.error(f"Ingestion Failed with code {process.returncode}")
                 try:
                     with open(os.path.join(Config.BASE_DIR, "ingest_status.json"), "w") as f:
-                        # Capture more of the error (500 chars) for debugging
-                        json.dump({"percent": 0, "message": f"Failed: {result.stderr[:500]}", "status": "error"}, f)
+                        json.dump({"percent": 0, "message": f"Failed (Code {process.returncode}). Check Docker logs.", "status": "error"}, f)
                 except: pass
         except Exception as e:
             logger.error(f"Ingestion Error: {e}")
@@ -359,8 +390,20 @@ def add_url_source():
         url = data.get('url')
         if not url: return jsonify({"error": "URL is required"}), 400
         
-        with open(os.path.join(Config.DATA_DIR, "urls.txt"), "a") as f:
-            f.write(f"\n{url}")
+        urls_file = os.path.join(Config.DATA_DIR, "urls.txt")
+        
+        # Deduplication Check
+        if os.path.exists(urls_file):
+            with open(urls_file, "r") as f:
+                existing_urls = {line.strip() for line in f if line.strip()}
+        else:
+            existing_urls = set()
+            
+        if url.strip() not in existing_urls:
+            with open(urls_file, "a") as f:
+                f.write(f"\n{url}")
+        else:
+            logger.info(f"Skipping duplicate URL: {url}")
             
         run_ingestion_background()
         
@@ -388,8 +431,21 @@ def upload_file_source():
             
             if filename == 'urls.txt':
                 content = file.read().decode('utf-8')
-                with open(os.path.join(Config.DATA_DIR, "urls.txt"), "a") as f:
-                    f.write("\n" + content)
+                urls_path = os.path.join(Config.DATA_DIR, "urls.txt")
+                
+                existing_urls = set()
+                if os.path.exists(urls_path):
+                    with open(urls_path, "r") as f:
+                        existing_urls = {line.strip() for line in f if line.strip()}
+                
+                new_urls = {line.strip() for line in content.splitlines() if line.strip()}
+                
+                # Merge
+                merged = sorted(list(existing_urls.union(new_urls)))
+                
+                with open(urls_path, "w") as f:
+                    f.write("\n".join(merged))
+                    
                 uploaded_count += 1
                 continue
             
@@ -422,7 +478,12 @@ def clear_database():
         logger.warning("CLEARING DATABASE & ARTIFACTS...")
         graph = get_db_connection()
         graph.query("MATCH (n) DETACH DELETE n")
-        create_vector_index(graph)
+        
+        # Recreate Indices Correctly
+        from database import create_text_vector_index, create_fulltext_index
+        create_vector_index(graph, dimensions=Config.EMBEDDING_DIMENSION) # Visual (128d)
+        create_text_vector_index(graph, dimensions=3072)                  # MinerU (3072d)
+        create_fulltext_index(graph)
         
         import shutil
         img_dir = os.path.join(Config.DATA_DIR, "extracted_images")
@@ -443,6 +504,13 @@ def clear_database():
              config['rules'] = []
              with open(Config.TRUST_CONFIG_FILE, "w") as f:
                 json.dump(config, f, indent=4)
+        
+        # Reset Ingest Status
+        status_file = os.path.join(Config.BASE_DIR, "ingest_status.json")
+        try:
+            with open(status_file, "w") as f:
+                json.dump({"percent": 0, "message": "✅ Database Wiped. Please Upload File to Start!", "status": "idle"}, f)
+        except: pass
 
         return jsonify({"status": "success", "message": "Database and artifacts cleared."})
     except Exception as e:
@@ -450,15 +518,16 @@ def clear_database():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    initialize_reranker()
-    
-    if os.name == 'nt' or Config.FLASK_ENV == 'development':
-         start_frontend()
-    
-    logger.info(f"Starting RAG API Server on port {Config.PORT}...")
     try:
+        initialize_reranker()
+        
+        if os.name == 'nt' or Config.FLASK_ENV == 'development':
+             start_frontend()
+        
+        logger.info(f"Starting RAG API Server on port {Config.PORT}...")
         app.run(host='0.0.0.0', debug=(Config.FLASK_ENV == 'development'), port=Config.PORT, use_reloader=False)
-    except KeyboardInterrupt:
-        pass
+    except Exception as e:
+        logger.critical(f"🔥 FATAL ERROR STARTING APP: {e}", exc_info=True)
+        sys.exit(1)
     finally:
         cleanup()

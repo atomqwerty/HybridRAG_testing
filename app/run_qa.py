@@ -18,9 +18,32 @@ from router import get_route
 logger = setup_logger(__name__)
 
 # 1. Connect to Neo4j
-graph = get_db_connection()
-create_vector_index(graph) 
-create_fulltext_index(graph)
+# 1. Connect to Neo4j
+# 1. Lazy Connection Logic
+_GRAPH = None
+
+def get_graph():
+    """Lazily connects to Neo4j to prevent import-time crashes."""
+    global _GRAPH
+    if _GRAPH is not None:
+        return _GRAPH
+    
+    try:
+        logger.info("Initializing Neo4j Connection...")
+        _GRAPH = get_db_connection()
+        
+        # Create Indices on first connect
+        create_vector_index(_GRAPH, dimensions=Config.EMBEDDING_DIMENSION) 
+        from database import create_text_vector_index
+        create_text_vector_index(_GRAPH, dimensions=3072)
+        create_fulltext_index(_GRAPH)
+        
+        logger.info("✅ Neo4j Connection & Indices Ready.")
+        return _GRAPH
+    except Exception as e:
+        logger.error(f"Neo4j Connection Failed: {e}")
+        # Return None or raise? Raising is better to fail gracefully per request
+        raise e
 
 # 2. Initialize Models
 embeddings = OpenAIEmbeddings(
@@ -98,7 +121,7 @@ def vector_retrieve(graph, embeddings, question, k=10, min_score=0.5, route="fas
     visual_boost = 0.2 if route == "visual_layout" else 0.0
     
     result = graph.query("""
-        CALL db.index.vector.queryNodes('chunk_vector_index', $k, $embedding)
+        CALL db.index.vector.queryNodes('text_vector_index', $k, $embedding)
         YIELD node, score
         WHERE score >= $min_score
         
@@ -114,7 +137,7 @@ def vector_retrieve(graph, embeddings, question, k=10, min_score=0.5, route="fas
         WITH node, score, full_context,
              (score + CASE WHEN node.modality = 'vision' OR node.modality = 'hybrid_vision' THEN $boost ELSE 0 END) as final_score
 
-        RETURN full_context AS text, node.source AS source, node.page AS page, final_score as score
+        RETURN full_context AS text, node.source AS source, node.page AS page, node.image_path AS image_path, final_score as score
         ORDER BY final_score DESC
     """, {"embedding": q_embedding, "k": k, "min_score": min_score, "boost": visual_boost})
     
@@ -131,8 +154,16 @@ def create_chunk_fulltext_index(graph):
 
 def keyword_retrieve(graph, question, k=5):
     """Retrieves chunks using Keyword Search."""
-    terms = question.split()
-    lucene_query = " AND ".join([f"{t}~" for t in terms if len(t) > 3])
+    # Saniitize input: remove special characters that break Lucene
+    import re
+    clean_q = re.sub(r'[^a-zA-Z0-9\s]', '', question)
+    terms = clean_q.split()
+    # Simple formatting: t~ for fuzzy, joined by AND. 
+    # Must have enough terms or it becomes too restrictive/empty.
+    if not terms:
+        return []
+        
+    lucene_query = " AND ".join([f"{t}~" for t in terms if len(t) > 2])
     
     if not lucene_query:
         return []
@@ -142,7 +173,7 @@ def keyword_retrieve(graph, question, k=5):
     query = """
     CALL db.index.fulltext.queryNodes("chunk_text_index", $query, {limit: $k})
     YIELD node, score
-    RETURN node.text as text, node.source as source, node.page as page, score
+    RETURN node.text as text, node.source as source, node.page as page, node.image_path as image_path, score
     """
     
     try:
@@ -227,6 +258,7 @@ def hybrid_context(graph, embeddings, question, llm_model, route="fast_fact"):
     context += graph_ctx if graph_ctx else "No direct entity facts found.\n"
     context += "\n### RELEVANT TEXT CHUNKS:\n"
     
+    seen_images = set()
     if vector_ctx:
         for row in vector_ctx:
             src = row.get('source', 'Unknown')
@@ -234,8 +266,15 @@ def hybrid_context(graph, embeddings, question, llm_model, route="fast_fact"):
             if src and os.path.sep in str(src):
                 src = str(src).split(os.path.sep)[-1]
             context += f"- {row['text']} [Source: {src}, Page: {pg}]\n"
-            if str(src).lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+            
+            # Logic to deduplicate images
+            img_p = row.get('image_path')
+            if img_p and img_p not in seen_images:
+                context += f" [IMAGE PATH: {img_p}]\n"
+                seen_images.add(img_p)
+            elif str(src).lower().endswith(('.jpg', '.jpeg', '.png', '.webp')) and src not in seen_images:
                 context += f" [IMAGE PATH: {src}]\n"
+                seen_images.add(src)
             if '[IMAGE' in row['text']:
                 context += "  (👆 THIS IS CONTENT EXTRACTED FROM AN INFOGRAPHIC/IMAGE. TREAT AS RELIABLE DATA.)\n"
     else:
@@ -354,6 +393,13 @@ def answer(question, history="", temperature=0.3):
     # --- ROUTER STEP ---
     route = get_route(standalone_question)
     logger.info(f"🚀 Query Route: {route}")
+
+    # Lazy Connect
+    try:
+        graph = get_graph()
+    except Exception as e:
+        logger.error(f"Cannot connect to DB: {e}")
+        return {"result": "⚠️ System Initializing... Please wait 10 seconds and try again.", "context": ""}
 
     context = hybrid_context(graph, embeddings, standalone_question, llm_model=dynamic_llm, route=route)
     

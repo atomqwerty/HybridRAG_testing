@@ -8,7 +8,8 @@ from langchain_core.output_parsers import StrOutputParser
 from dotenv import load_dotenv
 
 # Import from run_qa to reuse Graph/Retrieval logic
-from run_qa import graph, embeddings, hybrid_context
+# Import from run_qa (graph global removed, use get_graph)
+from run_qa import get_graph, embeddings, hybrid_context
 
 load_dotenv()
 
@@ -42,13 +43,22 @@ Standalone:"""
     
     # --- Step 2: Retrieve ---
     # This is the blocking part (2-3s)
+    try:
+        graph = get_graph()
+    except:
+        yield json.dumps({"type": "token", "content": "System Initializing..."}) + "\n"
+        return
+
     context = hybrid_context(graph, embeddings, standalone_question, llm_model=dynamic_llm)
     
     # Parse sources for frontend
     sources = []
+    seen_sources = set()
     matches = re.findall(r"\[Source: (.*?), Page: (.*?)\]", context)
     for src, pg in matches:
-        sources.append({"file": src, "page": pg})
+        if (src, pg) not in seen_sources:
+            sources.append({"file": src, "page": pg})
+            seen_sources.add((src, pg))
         
     # Find images
     images = []

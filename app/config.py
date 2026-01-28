@@ -32,19 +32,9 @@ class Config:
     SESSION_FILE = os.path.join(DATA_DIR, 'chat_sessions.json')
     TRUST_CONFIG_FILE = os.path.join(BASE_DIR, 'source_config.json')
 
-    # --- Vision RAG (ColiVara) ---
-    COLIVARA_API_URL = os.getenv("COLIVARA_API_URL", "http://localhost:8000/runsync")
-    # ColVQwen2 output dimension is typically 128 (binary) or larger float. 
-    # Standard late-interaction might return bag of vectors or single pooled?
-    # ColPali/ColQwen return multivectors per page (late interaction).
-    # BUT for Neo4j Vector Index we typically need a single dense vector per chunk.
-    # ColiVarE might support pooling. Let's assume 1024 or 768 for now or check docs.
-    # Actually, ColiVara docs say it uses "visual embedding" based on ColPali.
-    # We will assume a fixed dimension for now (e.g., 2048) and adjust after testing.
-    EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "128")) # ColPali often uses 128 per token, but we need pooled. 
-    # WARNING: Native ColPali = Matrices. We need to check if we can pool or if we need multi-vector support.
-    # For this MVP, we might need to assume ColiVarE handles the storage/retrieval 
-    # OR we just store the "visual summary" vector if it provides one.
+    # --- Vision RAG (Placeholder) ---
+    # We use a fixed dimension for visual embeddings (e.g. 128) for future expansion.
+    EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "128"))
     
     @classmethod
     def validate(cls):

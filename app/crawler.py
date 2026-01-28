@@ -23,7 +23,8 @@ DEFAULTS = {
         'audi', 'porsche', 'aion', 'wuling', 'nissan', 'toyota', 'honda', 'mazda', 'kia', 'hyundai', 
         'ford', 'mini', 'lexus', 'subaru', 'peugeot', 'jeep', 'xpeng', 'zeekr', 'deepal', 'lotus', 'lucid'
     ],
-    "keywords": ['ev-cars', 'model', 'spec', 'catalog', 'product', 'vehicle', 'showroom']
+    "keywords": ['ev-cars', 'model', 'spec', 'catalog', 'product', 'vehicle', 'showroom'],
+    "exclude": ['article', 'blog', 'news', 'install', 'guide', 'about', 'contact', 'career', 'faq', 'policy']
 }
 
 def get_crawler_rules():
@@ -100,12 +101,17 @@ def get_internal_links(base_url, max_links=200):
                 
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # --- SKIP SPECIFIC NAVIGATION SECTIONS (User Request) ---
-            # <div id="LayoutGrid7"> and <div id="wb_Text1navigator"> contains breadcrumbs to skip
-            for noise_id in ["LayoutGrid7", "wb_Text1navigator"]:
-                noise_div = soup.find(id=noise_id)
-                if noise_div:
-                    noise_div.decompose()
+            # --- SKIP HEADER/FOOTER/NAV to prevent crawling menus ---
+            for tag_name in ["header", "footer", "nav", "aside"]:
+                for tag in soup.find_all(tag_name):
+                    tag.decompose()
+            
+            # Remove by class/id keywords
+            noise_keywords = ["menu", "navigation", "footer", "header", "sidebar"]
+            for tag in soup.find_all(True):
+                classes = str(tag.get("class", "")) + " " + str(tag.get("id", ""))
+                if any(x in classes.lower() for x in noise_keywords):
+                    tag.decompose()
             # --------------------------------------------------------
             
             domain = urlparse(base_url).netloc
@@ -238,10 +244,14 @@ def is_relevant_car_url(url):
     noise = ['cart', 'login', 'facebook', 'line', 'tel:', 'mailto:', 'javascript', '#']
     if any(x in url for x in noise): return False
     
-    # Brands & Keywords
+    # Brands & Keywords & Excludes
     rules = get_crawler_rules()
     brands = rules.get("brands", [])
     keywords = rules.get("keywords", [])
+    excludes = rules.get("exclude", [])
+
+    # Check Excludes first
+    if any(ex in url for ex in excludes): return False
     
     # Must match at least one
     if any(b in url for b in brands) or any(k in url for k in keywords):
@@ -325,8 +335,8 @@ def load_web_with_images(url):
                 if img_resp.status_code != 200: continue
                 
                 size = len(img_resp.content)
-                # Removed size filter entirely to capture small logos
-                # if size < 2000: continue
+                # SMART FILTER: Ignore small icons/logos (< 15KB)
+                if size < 15 * 1024: continue
                 
                 # Save locally temporarily
                 suffix = Path(full_url).suffix
@@ -353,9 +363,8 @@ def load_web_with_images(url):
         # 3. Sort by Size (Descending) -> Largest images differ likely to be Main Content/Diagrams
         valid_images.sort(key=lambda x: x[0], reverse=True)
         
-        # 4. Select Images (Capture ALL valid ones, up to a reasonable limit to prevent timeout)
-        # We already filtered by size > 2KB earlier.
-        top_images = valid_images[:5] # OPTIMIZATION: Reduced from 50 to 5 (Huge speedup)
+        # 4. Select Images (Top 2 Large Images)
+        top_images = valid_images[:2] # Compromise: fast but gets cover + detail
         print(f"      🏆 Selected {len(top_images)} valid images >2KB for analysis.")
 
         # 5. Analyze with Vision
@@ -430,11 +439,42 @@ def load_web_with_images(url):
             print(f"      ⚠️ Failed to save web log: {e}")
         # ---------------------------
         
+        # 3. Determine Best Image (Cover) for the UI
+        best_image_path = "default.jpg"
+        if top_images:
+             # top_images is list of (_, path, url)
+             # Get filename: web_xxxx.jpg
+             best_image_path = top_images[0][1].name
+             print(f"      🖼️ Selected Best Cover Image: {best_image_path}")
+
         return [Document(
             page_content=full_content,
-            metadata={"source": url, "title": soup.title.string if soup.title else url}
+            metadata={
+                "source": url, 
+                "title": soup.title.string if soup.title else url,
+                "image_path": best_image_path # <-- NEW: Pass to DLT sink
+            }
         )]
         
     except Exception as e:
         print(f"      ❌ Web Scraping (Selenium) failed for {url}: {e}")
+        # Fallback to Requests (Static Scraping)
+        try:
+            print("      ⚠️ Attempting Fallback to Requests (Static HTML)...")
+            response = requests.get(url, headers={'User-Agent': Config.USER_AGENT}, timeout=10)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                text = soup.get_text(separator='\\n')
+                # Clean up whitespace
+                lines = (line.strip() for line in text.splitlines())
+                clean_text = '\\n'.join(line for line in lines if line)
+                
+                full_content = f"Source URL: {url}\\n(Fallback Scraping)\\n\\n{clean_text}"
+                return [Document(
+                    page_content=full_content,
+                    metadata={"source": url, "title": soup.title.string if soup.title else url}
+                )]
+        except Exception as e2:
+             print(f"      ❌ Fallback failed too: {e2}")
+        
         return []

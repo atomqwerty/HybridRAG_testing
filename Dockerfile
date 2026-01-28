@@ -18,8 +18,17 @@ WORKDIR /app
 # Install system dependencies (optional, for some python packages)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    chromium \
-    chromium-driver \
+    wget \
+    gnupg \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    && \
+    wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg && \
+    sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list' && \
+    apt-get update && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -41,4 +50,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
 # Run API
-CMD ["python", "api.py"]
+CMD ["python", "app/api.py"]
