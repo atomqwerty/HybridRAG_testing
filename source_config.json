@@ -3,22 +3,22 @@
     "rules": [
         {
             "pattern": "PrivacyPolicyEleXA.pdf",
-            "score": 1.0,
+            "score": 1,
             "type": "file"
         },
         {
             "pattern": "ev-charging-station-elexa-by-egat-2021.pdf",
-            "score": 1.0,
+            "score": 1,
             "type": "file"
         },
         {
             "pattern": "ananindustry.com",
-            "score": 1.0,
+            "score": 0.5,
             "type": "domain"
         },
         {
             "pattern": "EV_Manual.pdf",
-            "score": 1.0,
+            "score": 1,
             "type": "file"
         }
     ],
