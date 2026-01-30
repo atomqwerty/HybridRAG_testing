@@ -1,61 +1,91 @@
 import os
-import fitz # Still needed for fallback or basic info
+import subprocess
+import fitz  # PyMuPDF
+import glob
+import shutil
+import uuid
 from logger import setup_logger
 
 logger = setup_logger(__name__)
 
-try:
-    from magic_pdf.pipe.UNIPipe import UNIPipe
-    from magic_pdf.rw.DiskReaderWriter import DiskReaderWriter
-except ImportError:
-    logger.warning("MinerU (magic-pdf) not installed. Falling back to basic extraction.")
-    UNIPipe = None
-
 def extract_pdf_content_mineru(file_path):
     """
-    Extracts content from PDF using MinerU's UNIPipe.
-    Returns a list of dictionaries with text and layout info, or None if failed.
+    Extracts content from PDF using MinerU's CLI ('magic-pdf').
+    This avoids internal API instability by using the public CLI.
+    Returns markdown content or None if failed.
     """
-    if not UNIPipe:
-        # Fallback to PyMuPDF extraction
-        logger.warning("MinerU not available. Using standard text extraction.")
-        try:
-            doc = fitz.open(file_path)
-            full_text = ""
-            for i, page in enumerate(doc):
-                full_text += page.get_text() + "\n"
-            return full_text
-        except Exception as e:
-            logger.error(f"Fallback extraction failed: {e}")
-            return None
-
-    logger.info(f"⛏️  MinerU: Processing {os.path.basename(file_path)}...")
     
+    # 1. Check if magic-pdf is available in PATH
     try:
-        # 1. Prepare Reader
-        parent_dir = os.path.dirname(file_path)
-        file_name = os.path.basename(file_path)
-        image_writer = DiskReaderWriter(os.path.join(parent_dir, "images"))
+        subprocess.run(["magic-pdf", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    except FileNotFoundError:
+        logger.warning("MinerU (magic-pdf) CLI not found. Falling back to basic extraction.")
+        return extract_fallback(file_path)
+
+    # 2. Prepare Temp Directory
+    # magic-pdf creates a folder named after the pdf filename inside the output dir
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    # Sanitize basename for directory matching if needed, but magic-pdf handles it.
+    
+    unique_id = uuid.uuid4().hex
+    temp_output_dir = os.path.join("/tmp", f"mineru_{unique_id}")
+    os.makedirs(temp_output_dir, exist_ok=True)
+
+    try:
+        logger.info(f"MinerU: Processing {file_path} via CLI...")
+        # 3. Run CLI Command
+        # magic-pdf -p {file} -o {dir} -m auto
+        cmd = [
+            "magic-pdf", 
+            "-p", file_path, 
+            "-o", temp_output_dir,
+            "-m", "auto"
+        ]
         
-        # 2. Initialize Pipe
-        # Note: magic-pdf usually requires model caching. 
-        # If models aren't present, this might try to download them.
-        pipe = UNIPipe(file_path)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         
-        # 3. Run Classification & Parse
-        pipe.pipe_classify()
-        pipe.pipe_analyze()
-        pipe.pipe_parse()
+        if result.returncode != 0:
+            logger.error(f"MinerU CLI Failed: {result.stderr}")
+            return extract_fallback(file_path)
+
+        # 4. Find Output File
+        # Structure: output_dir / base_name / base_name.md
+        # We need to account for potential name sanitization by magic-pdf, so we glob.
+        expected_subdir = os.path.join(temp_output_dir, "auto") # magic-pdf 1.x might put it in 'auto' or direct.
+        # Let's search recursively for .md files
+        md_files = glob.glob(os.path.join(temp_output_dir, "**", "*.md"), recursive=True)
         
-        # 4. Get Results
-        # content_list = pipe.get_text_content() # This might vary by version
-        md_content = pipe.pipe_mk_markdown()
+        if not md_files:
+            logger.warning(f"MinerU finished but no .md file found in {temp_output_dir}. Fallback.")
+            return extract_fallback(file_path)
+            
+        # Pick the largest MD file (likely the content) or the one matching name
+        main_md_file = max(md_files, key=os.path.getsize)
         
-        # Return as a single "Page" concept for now, or split by page if supported
-        # UNIPipe effectively converts the whole doc.
-        
-        return md_content
-        
+        with open(main_md_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            
+        logger.info(f"MinerU: Successfully extracted {len(content)} chars.")
+        return content
+
     except Exception as e:
-        logger.error(f"MinerU Extraction Failed: {e}")
+        logger.error(f"MinerU Extraction Error: {e}")
+        return extract_fallback(file_path)
+    finally:
+        # Cleanup
+        if os.path.exists(temp_output_dir):
+            shutil.rmtree(temp_output_dir, ignore_errors=True)
+
+def extract_fallback(file_path):
+    """Basic extraction using PyMuPDF (fitz)"""
+    try:
+        doc = fitz.open(file_path)
+        text_content = ""
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            text_content += page.get_text()
+        doc.close()
+        return text_content
+    except Exception as e:
+        logger.error(f"PyMuPDF Fallback Failed: {e}")
         return None

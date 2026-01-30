@@ -2,7 +2,7 @@
 import os
 import time
 from dotenv import load_dotenv
-from langchain_community.graphs import Neo4jGraph
+from langchain_neo4j import Neo4jGraph
 
 # Load env variables if not already loaded (safe to call multiple times)
 load_dotenv()

@@ -7,7 +7,7 @@ import json
 import uuid
 import os
 import glob
-from langchain_community.graphs import Neo4jGraph
+from langchain_neo4j import Neo4jGraph
 from crawler import load_web_with_images, get_internal_links
 from logger import setup_logger
 
@@ -16,7 +16,7 @@ from utils import update_status, auto_add_trust_rule
 from mineru_utils import extract_pdf_content_mineru
 
 from langchain_core.documents import Document
-from database import create_vector_index, create_text_vector_index
+from database import create_vector_index, create_text_vector_index, get_db_connection
 import hashlib
 import fitz # PyMuPDF
 import base64
@@ -24,9 +24,23 @@ import requests
 from io import BytesIO
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_experimental.graph_transformers import LLMGraphTransformer
+from langchain_experimental.text_splitter import SemanticChunker
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
+
+def apply_safety_split(chunks, limit=2000):
+    """Checks for oversized semantic chunks and splits them recursively."""
+    final_chunks = []
+    safety_splitter = RecursiveCharacterTextSplitter(chunk_size=limit, chunk_overlap=200)
+    for chunk in chunks:
+        if len(chunk.page_content) > limit:
+            logger.info(f"   ⚠️ Enforcing Safety Split on oversized chunk ({len(chunk.page_content)} chars)")
+            sub_chunks = safety_splitter.split_documents([chunk])
+            final_chunks.extend(sub_chunks)
+        else:
+            final_chunks.append(chunk)
+    return final_chunks
 
 # --- Graph Helpers ---
 def clean_graph_schema(graph):
@@ -120,8 +134,11 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
             logger.info(f"   🧠 MinerU: Chunking & Embedding content for {source_id}...")
             
             # Chunking
-            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            # Chunking (Semantic)
+            # splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            splitter = SemanticChunker(embeddings=text_embeddings)
             chunks = splitter.create_documents([content])
+            chunks = apply_safety_split(chunks, limit=2000)
             
             prev_chunk_id = None
             
@@ -302,8 +319,10 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                 if "content" in item:
                     try:
                         logger.info(f"   🧠 Vectorizing Content for {identifier}...")
-                        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                        # splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                        splitter = SemanticChunker(embeddings=text_embeddings)
                         chunks = splitter.create_documents([item['content']])
+                        chunks = apply_safety_split(chunks, limit=2000)
                         
                         for i, chunk in enumerate(chunks):
                             chunk_text = chunk.page_content
@@ -365,7 +384,7 @@ def hybrid_rag_source(urls: list, files: list):
     # 1. Yield Files (Metadata only, heavy processing in Sink)
     for file_path in files:
         yield {
-            "type": "pdf" if file_path.endswith(".pdf") else "file",
+            "type": "pdf" if file_path.lower().endswith(".pdf") else "file",
             "file_id": file_path,
             "filename": os.path.basename(file_path),
             "source_type": "filesystem"
@@ -424,14 +443,36 @@ if __name__ == "__main__":
             prod_urls = list({line.strip() for line in f if line.strip()})
     
     prod_files = []
-    search_patterns = ["**/*.pdf", "**/*.docx", "**/*.txt"]
+    search_patterns = ["**/*.pdf", "**/*.PDF", "**/*.docx", "**/*.DOCX", "**/*.txt", "**/*.TXT"]
     for pattern in search_patterns:
         full_pattern = os.path.join(Config.DATA_DIR, pattern)
         prod_files.extend(glob.glob(full_pattern, recursive=True))
     
     prod_files = [f for f in prod_files if "dlt_output" not in f and "urls.txt" not in os.path.basename(f)]
 
-    msg = f"Loaded {len(prod_urls)} URLs and {len(prod_files)} Files."
+
+    # --- Incremental Ingestion Filter ---
+    try:
+        graph_conn = get_db_connection()
+        # Get all sources (Files and URLs) already in DB
+        res = graph_conn.query("MATCH (c:Chunk) RETURN DISTINCT c.source as source")
+        existing_sources = set([r['source'] for r in res])
+        print(f"DEBUG: Found {len(existing_sources)} existing sources in Neo4j.")
+    except Exception as e:
+        print(f"Warning: Could not check existing sources ({e}). Proceeding with full ingest.")
+        existing_sources = set()
+
+    # Filter URLs
+    original_url_count = len(prod_urls)
+    prod_urls = [u for u in prod_urls if u not in existing_sources]
+    print(f"Incremental Filter: URLs {original_url_count} -> {len(prod_urls)} (Skipped {original_url_count - len(prod_urls)})")
+
+    # Filter Files (Match by basename, as source typically = filename)
+    original_file_count = len(prod_files)
+    prod_files = [f for f in prod_files if os.path.basename(f) not in existing_sources]
+    print(f"Incremental Filter: Files {original_file_count} -> {len(prod_files)} (Skipped {original_file_count - len(prod_files)})")
+
+    msg = f"Processing {len(prod_urls)} New URLs and {len(prod_files)} New Files."
     print(msg)
     update_status(msg, 10)
     

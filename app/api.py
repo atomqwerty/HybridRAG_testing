@@ -427,9 +427,21 @@ def upload_file_source():
         uploaded_count = 0
         for file in files:
             if not file: continue
-            filename = file.filename
+            # Sanitize filename (Custom to allow Multi-language/Thai)
+            raw_name = file.filename
+            # Remove directory traversal
+            clean_name = os.path.basename(raw_name)
+            # Remove dangerous shell chars but keep Unicode (regex allows: word chars, dots, dashes, spaces, brackets, diff languages)
+            # Actually, standard OS usually just needs NO slashes/nulls. 
+            # We will just strip ".." and "/" which basename does.
+            # But let's be safe against weird control chars.
+            filename = re.sub(r'[^\w\s\-\.\[\]\(\)\u0E00-\u0E7F]', '', clean_name).strip()
             
+            # If empty after cleanup, fallback
+            if not filename: filename = f"uploaded_file_{uuid.uuid4().hex}.pdf"
+
             if filename == 'urls.txt':
+                # ... existing logic for urls.txt ...
                 content = file.read().decode('utf-8')
                 urls_path = os.path.join(Config.DATA_DIR, "urls.txt")
                 
@@ -439,16 +451,13 @@ def upload_file_source():
                         existing_urls = {line.strip() for line in f if line.strip()}
                 
                 new_urls = {line.strip() for line in content.splitlines() if line.strip()}
-                
-                # Merge
                 merged = sorted(list(existing_urls.union(new_urls)))
-                
                 with open(urls_path, "w") as f:
                     f.write("\n".join(merged))
-                    
                 uploaded_count += 1
                 continue
             
+            logger.info(f"Saving file as: {filename}")
             save_path = os.path.join(Config.DATA_DIR, filename)
             file.save(save_path)
             # auto_add_trust_rule(filename) -> Moved to ingest_dlt.py to show only after finish

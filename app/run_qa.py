@@ -1,7 +1,7 @@
 import os
 import re
 from PIL import Image
-from langchain_community.graphs import Neo4jGraph
+from langchain_neo4j import Neo4jGraph
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from database import get_db_connection, create_fulltext_index, create_vector_index
 
@@ -126,18 +126,25 @@ def vector_retrieve(graph, embeddings, question, k=10, min_score=0.5, route="fas
         WHERE score >= $min_score
         
         // --- Context Window Retrieval (Prev + Curr + Next) ---
-        OPTIONAL MATCH (prev)-[:NEXT]->(node)
-        OPTIONAL MATCH (node)-[:NEXT]->(next)
+        // 1. Try Graph Link
+        OPTIONAL MATCH (prev_link)-[:NEXT]->(node)
+        // 2. Try Index Math (Redundancy)
+        OPTIONAL MATCH (prev_math:Chunk) WHERE prev_math.source = node.source AND prev_math.seq = node.seq - 1
         
-        WITH node, score, prev, next
+        // 1. Try Graph Link
+        OPTIONAL MATCH (node)-[:NEXT]->(next_link)
+        // 2. Try Index Math (Redundancy)
+        OPTIONAL MATCH (next_math:Chunk) WHERE next_math.source = node.source AND next_math.seq = node.seq + 1
+        
+        WITH node, score, coalesce(prev_link, prev_math) as prev, coalesce(next_link, next_math) as next
         WITH node, score, 
-             coalesce(prev.text, '') + '\n--[Prev Chunk]--\n' + node.text + '\n--[Next Chunk]--\n' + coalesce(next.text, '') as full_context
+             coalesce(prev.text, '') + '\n--[Prev Chunk]--\n' + node.text + '\n--[Next Chunk]--\n' + coalesce(next.text, '') AS full_context
         
         // Boost score for sorting if Visual Intent and Node is Vision
         WITH node, score, full_context,
-             (score + CASE WHEN node.modality = 'vision' OR node.modality = 'hybrid_vision' THEN $boost ELSE 0 END) as final_score
+             (score + CASE WHEN node.modality = 'vision' OR node.modality = 'hybrid_vision' THEN $boost ELSE 0 END) AS final_score
 
-        RETURN full_context AS text, node.source AS source, node.page AS page, node.image_path AS image_path, final_score as score
+        RETURN full_context AS text, node.source AS source, node.page AS page, node.image_path AS image_path, final_score AS score
         ORDER BY final_score DESC
     """, {"embedding": q_embedding, "k": k, "min_score": min_score, "boost": visual_boost})
     
@@ -156,7 +163,8 @@ def keyword_retrieve(graph, question, k=5):
     """Retrieves chunks using Keyword Search."""
     # Saniitize input: remove special characters that break Lucene
     import re
-    clean_q = re.sub(r'[^a-zA-Z0-9\s]', '', question)
+    # Sanitize input: remove Lucene special characters but KEEP Unicode/Thai
+    clean_q = re.sub(r'[+\-&|!(){}\[\]^"~*?:\\/]', ' ', question)
     terms = clean_q.split()
     # Simple formatting: t~ for fuzzy, joined by AND. 
     # Must have enough terms or it becomes too restrictive/empty.
@@ -173,7 +181,15 @@ def keyword_retrieve(graph, question, k=5):
     query = """
     CALL db.index.fulltext.queryNodes("chunk_text_index", $query, {limit: $k})
     YIELD node, score
-    RETURN node.text as text, node.source as source, node.page as page, node.image_path as image_path, score
+    
+    // --- Context Window (Prev + Next) ---
+    OPTIONAL MATCH (prev)-[:NEXT]->(node)
+    OPTIONAL MATCH (node)-[:NEXT]->(next)
+    
+    WITH node, score, 
+         coalesce(prev.text, '') + '\n--[Prev Chunk]--\n' + node.text + '\n--[Next Chunk]--\n' + coalesce(next.text, '') AS full_context
+         
+    RETURN full_context as text, node.source as source, node.page as page, node.image_path as image_path, score
     """
     
     try:
