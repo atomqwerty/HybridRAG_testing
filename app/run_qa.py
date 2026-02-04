@@ -17,6 +17,23 @@ from router import get_route
 
 logger = setup_logger(__name__)
 
+# Thai Text Preprocessing Helper
+def preprocess_thai_query(question):
+    """Tokenizes Thai text to add spaces between words for better search."""
+    try:
+        from pythainlp import word_tokenize
+        import re
+        # Detect if query contains Thai characters (Unicode range \u0E00-\u0E7F)
+        if re.search(r'[\u0E00-\u0E7F]', question):
+            # Tokenize Thai text to add spaces between words
+            tokenized = word_tokenize(question, engine='newmm')
+            result = ' '.join(tokenized)
+            logger.info(f"Thai Tokenization: {question[:50]}... -> {result[:50]}...")
+            return result
+    except Exception as e:
+        logger.warning(f"Thai tokenization failed: {e}")
+    return question
+
 # 1. Connect to Neo4j
 # 1. Connect to Neo4j
 # 1. Lazy Connection Logic
@@ -125,20 +142,19 @@ def vector_retrieve(graph, embeddings, question, k=10, min_score=0.5, route="fas
         YIELD node, score
         WHERE score >= $min_score
         
-        // --- Context Window Retrieval (Prev + Curr + Next) ---
-        // 1. Try Graph Link
-        OPTIONAL MATCH (prev_link)-[:NEXT]->(node)
-        // 2. Try Index Math (Redundancy)
-        OPTIONAL MATCH (prev_math:Chunk) WHERE prev_math.source = node.source AND prev_math.seq = node.seq - 1
+        // --- Context Window Retrieval (Extended to +/- 2) ---
+        // 1. Prev Chunks
+        OPTIONAL MATCH (prev)-[:NEXT]->(node)
+        OPTIONAL MATCH (prev2)-[:NEXT]->(prev)
         
-        // 1. Try Graph Link
-        OPTIONAL MATCH (node)-[:NEXT]->(next_link)
-        // 2. Try Index Math (Redundancy)
-        OPTIONAL MATCH (next_math:Chunk) WHERE next_math.source = node.source AND next_math.seq = node.seq + 1
+        // 2. Next Chunks
+        OPTIONAL MATCH (node)-[:NEXT]->(next)
+        OPTIONAL MATCH (next)-[:NEXT]->(next2)
         
-        WITH node, score, coalesce(prev_link, prev_math) as prev, coalesce(next_link, next_math) as next
         WITH node, score, 
-             coalesce(prev.text, '') + '\n--[Prev Chunk]--\n' + node.text + '\n--[Next Chunk]--\n' + coalesce(next.text, '') AS full_context
+             coalesce(prev2.text + '\n', '') + coalesce(prev.text + '\n', '') + 
+             node.text + 
+             coalesce('\n' + next.text, '') + coalesce('\n' + next2.text, '') AS full_context
         
         // Boost score for sorting if Visual Intent and Node is Vision
         WITH node, score, full_context,
@@ -161,6 +177,9 @@ def create_chunk_fulltext_index(graph):
 
 def keyword_retrieve(graph, question, k=5):
     """Retrieves chunks using Keyword Search."""
+    # Thai Text Preprocessing
+    question = preprocess_thai_query(question)
+    
     # Saniitize input: remove special characters that break Lucene
     import re
     # Sanitize input: remove Lucene special characters but KEEP Unicode/Thai
@@ -171,26 +190,37 @@ def keyword_retrieve(graph, question, k=5):
     if not terms:
         return []
         
-    lucene_query = " AND ".join([f"{t}~" for t in terms if len(t) > 2])
+    # Relaxed Logic: Use OR for broad recall, let Lucene scoring handle relevance.
+    # AND is too strict for long natural language queries.
+    # Filter: must be at least 2 chars AND contain at least one alphanumeric char
+    lucene_query = " OR ".join([f"{t}~" for t in terms if len(t) >= 2 and re.search(r'[\w\u0E00-\u0E7F0-9]', t)])
     
     if not lucene_query:
         return []
         
-    logger.info(f"Keyword Search Query: {lucene_query}")
+    logger.info(f"Keyword Search Query (Relaxed): {lucene_query}")
     
     query = """
-    CALL db.index.fulltext.queryNodes("chunk_text_index", $query, {limit: $k})
-    YIELD node, score
-    
-    // --- Context Window (Prev + Next) ---
-    OPTIONAL MATCH (prev)-[:NEXT]->(node)
-    OPTIONAL MATCH (node)-[:NEXT]->(next)
-    
-    WITH node, score, 
-         coalesce(prev.text, '') + '\n--[Prev Chunk]--\n' + node.text + '\n--[Next Chunk]--\n' + coalesce(next.text, '') AS full_context
-         
-    RETURN full_context as text, node.source as source, node.page as page, node.image_path as image_path, score
-    """
+        CALL db.index.fulltext.queryNodes("chunk_text_index", $query, {limit: $k})
+        YIELD node, score
+        
+        // --- Page-Level Retrieval: Get ALL chunks from the same page ---
+        MATCH (page_chunk:Chunk)
+        WHERE page_chunk.source = node.source 
+          AND page_chunk.page = node.page
+        WITH node, score, collect(page_chunk) as page_chunks
+        
+        // Sort by sequence
+        UNWIND page_chunks as chunk
+        WITH node, score, chunk
+        ORDER BY chunk.seq
+        
+        // Concatenate
+        WITH node, score, collect(chunk.text) as all_texts
+        WITH node, score, reduce(s = '', text IN all_texts | s + '\\n' + text) as full_page_context
+        
+        RETURN full_page_context as text, node.source as source, node.page as page, node.image_path as image_path, score
+        """
     
     try:
         results = graph.query(query, {"query": lucene_query, "k": k})
@@ -229,7 +259,8 @@ def hybrid_context(graph, embeddings, question, llm_model, route="fast_fact"):
     graph_ctx = retrieve_graph_context(graph, llm_model, question, limit=graph_limit)
 
     # 2. HYBRID SEARCH
-    keyword_ctx = keyword_retrieve(graph, question, k=5)
+    keyword_ctx = keyword_retrieve(graph, question, k=15)
+    logger.info(f"📊 Keyword Retrieval: {len(keyword_ctx)} results")
     
     # Vector Search (Multi-Query)
     queries_to_run = [question]
@@ -253,9 +284,11 @@ def hybrid_context(graph, embeddings, question, llm_model, route="fast_fact"):
             
     vector_ctx = list(vector_results_map.values())
     vector_ctx.sort(key=lambda x: x.get('score', 0), reverse=True)
+    logger.info(f"📊 Vector Retrieval: {len(vector_ctx)} results")
     
     combined_results = reciprocal_rank_fusion([keyword_ctx, vector_ctx])
     vector_ctx = combined_results
+    logger.info(f"📊 After RRF Fusion: {len(vector_ctx)} results")
 
     # Re-rank
     if vector_ctx:
@@ -267,8 +300,11 @@ def hybrid_context(graph, embeddings, question, llm_model, route="fast_fact"):
         # Merge back for reranking
         vector_ctx = text_results + image_file_results
         
-        reranked = rerank_results(question, vector_ctx, top_k=5, method=Config.RERANKER_METHOD, llm_model=llm_model)
+        reranked = rerank_results(question, vector_ctx, top_k=10, method=Config.RERANKER_METHOD, llm_model=llm_model)
         vector_ctx = reranked
+        logger.info(f"📊 After Reranking (top_k=10): {len(vector_ctx)} results")
+        if vector_ctx:
+            logger.info(f"📄 First result preview: {vector_ctx[0]['text'][:300]}...")
 
     context = "### GRAPH KNOWLEDGE BITS:\n"
     context += graph_ctx if graph_ctx else "No direct entity facts found.\n"

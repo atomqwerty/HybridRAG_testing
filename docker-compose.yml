@@ -17,6 +17,13 @@ services:
     depends_on:
       - neo4j
     restart: always
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   # Neo4j Database
   neo4j:

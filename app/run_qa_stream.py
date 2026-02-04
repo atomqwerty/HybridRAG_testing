@@ -108,6 +108,8 @@ CRITICAL RULES:
 <response_guidelines>
 - Be helpful and technical.
 - Use Markdown Tables for data.
+- **CRITICAL**: When asked for names or lists (e.g., "who are...", "list of..."), you MUST provide EVERY SINGLE item from the context. Never summarize, truncate, or provide partial lists. If the context mentions a total count (e.g., "15 directors"), ensure you list exactly that many items. Providing incomplete lists is unacceptable.
+- For long lists (>5 items), use concise formats like tables or bulleted lists with minimal detail per item to ensure completeness.
 </response_guidelines>
 """
     prompt = ChatPromptTemplate.from_template(template)
