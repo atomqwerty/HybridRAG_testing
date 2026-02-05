@@ -15,17 +15,14 @@ import json
 from langchain_core.documents import Document
 from vision_utils import describe_image, encode_image_from_file
 from config import Config
+from PIL import Image
 
 # --- CONFIG LOADER ---
 DEFAULTS = {
-    "brands": [
-        'byd', 'tesla', 'mg', 'neta', 'ora', 'gwm', 'haval', 'volvo', 'bmw', 'benz', 'mercedes', 
-        'audi', 'porsche', 'aion', 'wuling', 'nissan', 'toyota', 'honda', 'mazda', 'kia', 'hyundai', 
-        'ford', 'mini', 'lexus', 'subaru', 'peugeot', 'jeep', 'xpeng', 'zeekr', 'deepal', 'lotus', 'lucid'
-    ],
-    "keywords": ['ev-cars', 'model', 'spec', 'catalog', 'product', 'vehicle', 'showroom'],
-    "exclude": ['article', 'blog', 'news', 'install', 'guide', 'about', 'contact', 'career', 'faq', 'policy']
-}
+    "brands": [], # User should populate this in source_config.json
+    "keywords": ['product', 'detail', 'spec', 'model', 'feature', 'category'],
+    "exclude": ['login', 'cart', 'account', 'register', 'policy', 'terms', 'privacy']
+} 
 
 def get_crawler_rules():
     """Loads dynamic brands/keywords from JSON, falls back to defaults."""
@@ -161,6 +158,9 @@ def get_internal_links(base_url, max_links=200):
                     # 2. Check Anchor Text for brands
                     if any(b in link_text for b in brands): is_car_link = True
                     
+                    # In Generic Mode, every link is a "car link" unless excluded
+                    is_car_link = True
+                    
                     # If it's NOT a car link, skip it (unless we are at root level, where we might need to navigate categories)
                     # But user asked for "only car link".
                     if not is_car_link and depth > 0:
@@ -246,18 +246,13 @@ def is_relevant_car_url(url):
     
     # Brands & Keywords & Excludes
     rules = get_crawler_rules()
-    brands = rules.get("brands", [])
-    keywords = rules.get("keywords", [])
     excludes = rules.get("exclude", [])
 
     # Check Excludes first
     if any(ex in url for ex in excludes): return False
     
-    # Must match at least one
-    if any(b in url for b in brands) or any(k in url for k in keywords):
-        return True
-        
-    return False
+    # Generic Mode: Follow ALL internal links (except excluded ones)
+    return True
 
 def load_web_with_images(url):
     """
@@ -318,7 +313,7 @@ def load_web_with_images(url):
             full_url = urljoin(url, src)
             
             # Filter noise keywords in URL (Removed 'logo' as requested)
-            if any(x in full_url.lower() for x in ['icon', 'button', 'social', 'footer']): 
+            if any(x in full_url.lower() for x in ['icon', 'button', 'social', 'footer', 'thumb', 'thumbnail']): 
                 continue
                 
             candidates.append(full_url)
@@ -335,8 +330,8 @@ def load_web_with_images(url):
                 if img_resp.status_code != 200: continue
                 
                 size = len(img_resp.content)
-                # SMART FILTER: Ignore small icons/logos (< 15KB)
-                if size < 15 * 1024: continue
+                # SMART FILTER: Ignore small icons/logos (< 35KB)
+                if size < 35 * 1024: continue
                 
                 # Save locally temporarily
                 suffix = Path(full_url).suffix
@@ -354,7 +349,21 @@ def load_web_with_images(url):
                 # Skip SVGs
                 if img_path.suffix.lower() == '.svg': 
                     continue
-                    
+
+                # --- NEW: Check Dimensions (Resolution Filter) ---
+                try:
+                    with Image.open(img_path) as im:
+                        w, h = im.size
+                        # Reject if too small (thumbnail size like 300x163)
+                        # We want Hero Images > 450x300
+                        if w < 450 or h < 300:
+                            # print(f"      - Rejected small image: {w}x{h}")
+                            continue
+                except Exception:
+                    # If PIL cannot open it, it's likely corrupt
+                    continue
+                # -----------------------------------------------
+
                 valid_images.append((size, img_path, full_url))
                 
             except:
@@ -395,8 +404,17 @@ def load_web_with_images(url):
         for tag in soup(noise_tags):
             tag.decompose()
             
-        # B. Remove elements by Class/ID (Menus, Sidebars, Popups)
-        trash_keywords = ['menu', 'sidebar', 'nav', 'cookie', 'advert', 'popup', 'social', 'share', 'newsletter']
+        # Remove breadcrumbs specifically (User Request)
+        for tag in soup.find_all(True, {"class": True}):
+             try:
+                 classes = tag.get("class", [])
+                 if isinstance(classes, str): classes = [classes]
+                 if any("breadcrumb" in c.lower() for c in classes):
+                     tag.decompose()
+             except: pass
+            
+        # B. Remove elements by Class/ID (Menus, Sidebars, Popups, Footers)
+        trash_keywords = ['menu', 'sidebar', 'nav', 'cookie', 'advert', 'popup', 'social', 'share', 'newsletter', 'footer', 'copyright', 'contact']
         for tag in soup.find_all(True, {"class": True}):
             try:
                 # Check classes

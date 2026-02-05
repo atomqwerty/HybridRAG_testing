@@ -23,9 +23,19 @@ Several critical bugs preventing ingestion were resolved:
 - **Removed**: `semantic-router` and `langchain-neo4j` were removed from `requirements.txt` as they were causing install errors and weren't strictly required (code had fallback logic).
 
 ### C. Selenium / Chrome Crawler
-- **Driver Installation**: Patched `crawler.py` to use `webdriver-manager` instead of a hardcoded `/usr/bin/chromedriver` path.
-- **Browser Binary**: Installed Google Chrome Stable (`v144`) using a custom script to resolve "cannot find Chrome binary" errors.
-- **Image Extraction Path**: Fixed logic in `crawler.py` to successfully save images to `data/extracted_images/` using absolute paths (`Config.DATA_DIR`), resolving the issue where images were dumped in `data/`.
+- **Driver Installation**: Patched `setup_driver` to use `webdriver-manager`.
+    - **Mechanism**: Dynamically downloads the `chromedriver` binary matching the installed Google Chrome version (`v144`), eliminating "binary version mismatch" errors.
+    - **Chrome Options**: Configured for container stability:
+        - `--headless`: Runs without UI.
+        - `--no-sandbox`: Required for Docker root execution.
+        - `--disable-dev-shm-usage`: Prevents shared memory crashes in low-resource containers.
+- **RPA & Lazy Loading**:
+    - **Auto-Scrolling**: Implemented a JavaScript loop (`window.scrollTo`) to trigger lazy-loaded elements before scraping.
+    - **Fallback**: Wrapped Selenium logic in a `try/except` block. If the driver crashes, it automatically falls back to `requests` for static HTML scraping.
+- **Smart Image Extraction**:
+    - **Filtering**: Ignores icons/logos (< 35KB) and low-resolution images (< 450x300 px), ensuring only high-quality "Hero" images are captured.
+    - **Storage**: Saves high-resolution images (>35KB) to `data/extracted_images/` using absolute paths, resolving the "dumped in root" issue.
+    - **Integration**: Passes the best "Cover Image" path to the indexing pipeline for UI display.
 
 ### D. Permissions
 - **Root Ownership Fix**: Reclaimed ownership of `log/` and `data/` directories (which were owned by `root`) using `sudo chown`.

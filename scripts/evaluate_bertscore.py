@@ -12,7 +12,7 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 
-def evaluate_from_csv(input_csv: str, output_csv: str):
+def evaluate_from_csv(input_csv: str, output_csv: str, model_type: str = "xlm-roberta-base"):
     """Reads Q&A from CSV, gets chatbot answers, and calculates scores."""
     import pandas as pd
     import sys
@@ -41,7 +41,7 @@ def evaluate_from_csv(input_csv: str, output_csv: str):
         return
 
     results = []
-    logger.info(f"Evaluating {len(df)} samples...")
+    logger.info(f"Evaluating {len(df)} samples using model: {model_type}...")
 
     for i, (_, row) in enumerate(df.iterrows()):
         question = str(row['Question'])
@@ -58,7 +58,7 @@ def evaluate_from_csv(input_csv: str, output_csv: str):
             prediction = "ERROR"
 
         # Evaluate Single Pair
-        scores = evaluate_thai_bertscore([prediction], [reference], verbose=False)
+        scores = evaluate_thai_bertscore([prediction], [reference], model_type=model_type, verbose=False)
         
         results.append({
             "Question": question,
@@ -137,14 +137,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate RAG Chatbot using BERTScore")
     parser.add_argument("--input", type=str, help="Path to input CSV (cols: Question, Ground Truth)")
     parser.add_argument("--output", type=str, default="Eva_data/evaluation_results.csv", help="Path to output CSV")
+    parser.add_argument("--model", type=str, default="xlm-roberta-base", help="Validation model (e.g. bert-base-multilingual-cased)")
     args = parser.parse_args()
 
     if args.input:
-        evaluate_from_csv(args.input, args.output)
+        evaluate_from_csv(args.input, args.output, args.model)
     else:
         # Test cases
         print("--- Testing Thai BERTScore (Dummy Data) ---")
         preds = ["บริษัทมีกรรมการทั้งหมด 15 คน"]
         refs = ["คณะกรรมการของบริษัทมีจำนวนรวมทั้งสิ้น 15 ท่าน"]
-        results = evaluate_thai_bertscore(preds, refs)
+        results = evaluate_thai_bertscore(preds, refs, model_type=args.model)
         print(f"F1 Score:  {results['f1']:.4f}")
