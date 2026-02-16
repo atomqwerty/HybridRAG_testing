@@ -8,7 +8,7 @@ import uuid
 import os
 import glob
 from langchain_neo4j import Neo4jGraph
-from crawler import load_web_with_images, get_internal_links
+from crawler import load_web_with_images, get_internal_links, init_driver
 from logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -377,7 +377,7 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
         logger.error(f"Neo4j Sink Error: {e}")
 
 @dlt.resource(name="hybrid_rag_data", write_disposition="replace")
-def hybrid_rag_source(urls: list, files: list):
+def hybrid_rag_source(urls: list, files: list, existing_ids: set = None):
     """
     DLT Resource that yields data from both Files and URLs.
     """
@@ -401,30 +401,55 @@ def hybrid_rag_source(urls: list, files: list):
             
             print(f"DEBUG: deep crawling for {url}...")
             # 1. Discover Sub-pages (Crawl)
-            sub_urls = get_internal_links(url, max_links=50) # Limit to 50 pages for speed
+            sub_urls = get_internal_links(url, max_links=300) # Increased to 300 for better breadth
             all_urls = [url] + sub_urls
             # Remove duplicates
             all_urls = list(set(all_urls))
             
             print(f"DEBUG: Found {len(all_urls)} pages to scrape for {url}")
             
-            for page_url in all_urls:
-                try:
-                    print(f"DEBUG: Calling load_web_with_images for {page_url}")
-                    docs = load_web_with_images(page_url)
-                    print(f"DEBUG: Received {len(docs)} docs from {page_url}")
-                    
-                    for doc in docs:
-                        yield {
-                            "type": "web",
-                            "url": page_url,
-                            "content": doc.page_content,
-                            "metadata": doc.metadata,
-                            "source_type": "web"
-                        }
-                except Exception as e:
-                     print(f"DEBUG: Error processing page {page_url}: {e}")
-                     continue
+            print(f"DEBUG: Found {len(all_urls)} pages to scrape for {url}")
+            
+            # Incremental Check per Page
+            if existing_ids:
+                new_urls = [u for u in all_urls if u not in existing_ids]
+                if not new_urls:
+                    print(f"DEBUG: All {len(all_urls)} pages already ingested for {url}. Skipping.")
+                    continue
+                print(f"DEBUG: found {len(new_urls)} NEW pages to ingest (from {len(all_urls)} candidates).")
+                all_urls = new_urls
+
+            # --- OPTIMIZATION: Use Shared Driver ---
+            driver = None
+            try:
+                driver = init_driver()
+            except Exception as e:
+                print(f"DEBUG: Failed to init shared driver: {e}")
+            
+            try:
+                for page_url in all_urls:
+                    try:
+                        print(f"DEBUG: Calling load_web_with_images for {page_url}")
+                        # Pass shared driver!
+                        docs = load_web_with_images(page_url, driver=driver)
+                        print(f"DEBUG: Received {len(docs)} docs from {page_url}")
+                        
+                        for doc in docs:
+                            yield {
+                                "type": "web",
+                                "url": page_url,
+                                "content": doc.page_content,
+                                "metadata": doc.metadata,
+                                "source_type": "web"
+                            }
+                    except Exception as e:
+                         print(f"DEBUG: Error processing page {page_url}: {e}")
+                         continue
+            finally:
+                if driver:
+                    print("DEBUG: Quitting Shared Driver...")
+                    driver.quit()
+            # ---------------------------------------
         except Exception as e:
             print(f"DEBUG: Error processing {url}: {e}")
             logger.error(f"Failed to yield URL {url}: {e}")
@@ -462,10 +487,12 @@ if __name__ == "__main__":
         print(f"Warning: Could not check existing sources ({e}). Proceeding with full ingest.")
         existing_sources = set()
 
-    # Filter URLs
+    # Filter URLs - MODIFIED: Do NOT filter seeds upfront.
+    # We want to crawl seeds to find NEW sub-pages (Generic Mode).
+    # We will filter individual discovered pages inside `hybrid_rag_source`.
     original_url_count = len(prod_urls)
-    prod_urls = [u for u in prod_urls if u not in existing_sources]
-    print(f"Incremental Filter: URLs {original_url_count} -> {len(prod_urls)} (Skipped {original_url_count - len(prod_urls)})")
+    # prod_urls = [u for u in prod_urls if u not in existing_sources] # <-- REMOVED
+    print(f"Incremental Strategy: scanning {original_url_count} seeds for new content...")
 
     # Filter Files (Match by basename, as source typically = filename)
     original_file_count = len(prod_files)
@@ -476,7 +503,7 @@ if __name__ == "__main__":
     print(msg)
     update_status(msg, 10)
     
-    target_urls = prod_urls if prod_urls else ["https://example.com/placeholder"]
+    target_urls = prod_urls
     target_files = prod_files if prod_files else [] 
 
     # Run the pipeline
@@ -493,7 +520,7 @@ if __name__ == "__main__":
     update_status("Running Extraction & DLT Load...", 20)
     
     load_info = pipeline.run(
-        hybrid_rag_source(target_urls, target_files), 
+        hybrid_rag_source(target_urls, target_files, existing_sources), 
         loader_file_format="jsonl"
     )
     print(load_info)
@@ -502,7 +529,7 @@ if __name__ == "__main__":
     update_status("Syncing to Knowledge Graph (Neo4j)...", 60)
     print("Writing to Neo4j...")
     
-    data = list(hybrid_rag_source(target_urls, target_files)) 
+    data = list(hybrid_rag_source(target_urls, target_files, existing_sources)) 
     
     all_items = data
         

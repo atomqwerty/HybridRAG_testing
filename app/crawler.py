@@ -1,4 +1,3 @@
-
 import os
 import requests
 import uuid
@@ -16,6 +15,7 @@ from langchain_core.documents import Document
 from vision_utils import describe_image, encode_image_from_file
 from config import Config
 from PIL import Image
+from urllib.parse import unquote
 
 # --- CONFIG LOADER ---
 DEFAULTS = {
@@ -31,7 +31,8 @@ def get_crawler_rules():
         if config_path.exists():
             with open(config_path, "r") as f:
                 data = json.load(f)
-                return data.get("crawler_config", DEFAULTS)
+                config = data.get("crawler_config")
+                return config if config is not None else DEFAULTS
     except Exception as e:
         print(f"⚠️ Error loading crawler config: {e}")
     return DEFAULTS
@@ -104,8 +105,9 @@ def get_internal_links(base_url, max_links=200):
                     tag.decompose()
             
             # Remove by class/id keywords
-            noise_keywords = ["menu", "navigation", "footer", "header", "sidebar"]
+            noise_keywords = ["menu", "navigation", "footer", "header", "sidebar", "copyright", "contact"]
             for tag in soup.find_all(True):
+                if not hasattr(tag, 'attrs') or tag.attrs is None: continue # Safety Check
                 classes = str(tag.get("class", "")) + " " + str(tag.get("id", ""))
                 if any(x in classes.lower() for x in noise_keywords):
                     tag.decompose()
@@ -136,13 +138,14 @@ def get_internal_links(base_url, max_links=200):
                     
                     # Filter noise (Minimal - Only strictly useless links)
                     path = parsed.path.lower()
-                    noise = ['cart', 'login', 'facebook', 'line', 'tel:', 'mailto:', 'javascript', '#', 'review', 'news', 'blog']
+                    noise = ['cart', 'login', 'facebook', 'line', 'tel:', 'mailto:', 'javascript', '#', 'review', 'news', 'blog', 'index.html']
                     if any(x in path or x in full_url.lower() for x in noise): 
                         continue
                     
                     # --- SMART CAR FILTER ---
                     # The user wants "only car links". We use Brand & Keyword matching.
                     rules = get_crawler_rules()
+                    if not rules: rules = DEFAULTS # Double safety
                     brands = rules.get("brands", [])
                     keywords = rules.get("keywords", [])
                     
@@ -241,7 +244,7 @@ def is_relevant_car_url(url):
     url = url.lower()
     
     # Explicit Skip
-    noise = ['cart', 'login', 'facebook', 'line', 'tel:', 'mailto:', 'javascript', '#']
+    noise = ['cart', 'login', 'facebook', 'line', 'tel:', 'mailto:', 'javascript', '#', 'index.html']
     if any(x in url for x in noise): return False
     
     # Brands & Keywords & Excludes
@@ -254,13 +257,9 @@ def is_relevant_car_url(url):
     # Generic Mode: Follow ALL internal links (except excluded ones)
     return True
 
-def load_web_with_images(url):
-    """
-    Uses Selenium (RPA) to render the page, scroll for lazy loading,
-    and extract high-fidelity text and images.
-    """
-    print(f"   - Scraping (RPA/Selenium): {url}")
-    
+def init_driver():
+    """Initializes a headless Chrome driver."""
+    print("DEBUG: Initializing Shared Chrome Driver...")
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--disable-gpu")
@@ -269,16 +268,35 @@ def load_web_with_images(url):
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument(f"user-agent={Config.USER_AGENT}")
     
-    print(f"DEBUG: Initializing Chrome Driver for {url}")
     try:
         from webdriver_manager.chrome import ChromeDriverManager
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        print("DEBUG: Driver initialized")
+        return driver
+    except Exception as e:
+        print(f"❌ Failed to init driver: {e}")
+        return None
 
+def load_web_with_images(url, driver=None):
+    """
+    Uses Selenium (RPA) to render the page, scroll for lazy loading,
+    and extract high-fidelity text and images.
+    """
+    print(f"   - Scraping (RPA/Selenium): {url}")
+    
+    should_quit_driver = False
+    if driver is None:
+        print(f"DEBUG: No shared driver provided. Creating new one for {url}")
+        driver = init_driver()
+        should_quit_driver = True
+    
+    if not driver:
+        return [] # Fail if no driver
         
+    try:
         try:
-            driver.get(url)
+            driver.get(url)  
+            # ... (Rest of logic uses 'driver')
             
             # --- RPA Action: Scroll to Bottom to trigger Lazy Loading ---
             print("      ↓ Auto-scrolling to trigger lazy content...")
@@ -296,7 +314,8 @@ def load_web_with_images(url):
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             
         finally:
-            driver.quit()
+            if should_quit_driver:
+                driver.quit()
         
         # 1. Extract Images (from the rendered Soup)
         images = soup.find_all('img')
@@ -330,10 +349,18 @@ def load_web_with_images(url):
                 if img_resp.status_code != 200: continue
                 
                 size = len(img_resp.content)
-                # SMART FILTER: Ignore small icons/logos (< 35KB)
-                if size < 35 * 1024: continue
-                
-                # Save locally temporarily
+                # SMART FILTER: Ignore small icons/logos (< 5KB, was 15KB)
+                if size < 5 * 1024: 
+                    print(f"      - Rejected small file size ({size} bytes): {full_url}")
+                    continue
+            
+                # BLACKLIST: Ignore known generic images
+                decoded_url = unquote(full_url.lower())
+                if "home-charging" in decoded_url or "line-add" in decoded_url:
+                    print(f"      - Skipping Blacklisted Image: {full_url}")
+                    continue
+
+                # --- NEW: Check Dimensions (Resolution Filter) ---
                 suffix = Path(full_url).suffix
                 if not suffix or suffix.lower() not in ['.jpg', '.png', '.jpeg', '.webp']:
                     suffix = '.jpg'
@@ -355,18 +382,21 @@ def load_web_with_images(url):
                     with Image.open(img_path) as im:
                         w, h = im.size
                         # Reject if too small (thumbnail size like 300x163)
-                        # We want Hero Images > 450x300
-                        if w < 450 or h < 300:
-                            # print(f"      - Rejected small image: {w}x{h}")
+                        # We want Hero Images > 250x200
+                        # We want Hero Images > 200x150
+                        if w < 200 or h < 150:
+                            # print(f"      - Rejected small image ({w}x{h}): {full_url}")
                             continue
                 except Exception:
                     # If PIL cannot open it, it's likely corrupt
                     continue
                 # -----------------------------------------------
 
+                print(f"      ✅ Accepted Image: {full_url} ({size} bytes, {w}x{h})")
                 valid_images.append((size, img_path, full_url))
                 
-            except:
+            except Exception as e:
+                print(f"      ❌ Image Error {full_url}: {e}")
                 continue
         
         # 3. Sort by Size (Descending) -> Largest images differ likely to be Main Content/Diagrams
@@ -382,12 +412,13 @@ def load_web_with_images(url):
                 print(f"      📸 Analyzed Web Image: {os.path.basename(full_url)[:30]}...")
                 b64 = encode_image_from_file(str(img_path))
                 
-                # Save description
-                log_dir = Path("log")
-                log_dir.mkdir(parents=True, exist_ok=True)
-                desc_path = log_dir / (img_path.stem + '_description.txt')
+                # Save description (DISABLED LOGGING)
+                # log_dir = Path("log")
+                # log_dir.mkdir(parents=True, exist_ok=True)
+                # desc_path = log_dir / (img_path.stem + '_description.txt')
                 
-                desc = describe_image(b64, save_description_path=str(desc_path))
+                # Pass None to save_description_path to avoid file creation
+                desc = describe_image(b64, save_description_path=None)
                 # Store path relative to project root for frontend serving
                 rel_img_path = str(img_path).replace("\\", "/") # Ensure forward slashes
                 image_descriptions += f"\\n[IMAGE PATH: {rel_img_path}]\\n[SOURCE URL: {full_url}]\\n{desc}\\n"
@@ -414,14 +445,25 @@ def load_web_with_images(url):
              except: pass
             
         # B. Remove elements by Class/ID (Menus, Sidebars, Popups, Footers)
-        trash_keywords = ['menu', 'sidebar', 'nav', 'cookie', 'advert', 'popup', 'social', 'share', 'newsletter', 'footer', 'copyright', 'contact']
-        for tag in soup.find_all(True, {"class": True}):
+        trash_keywords = ['menu', 'sidebar', 'nav', 'cookie', 'advert', 'popup', 'social', 'share', 'newsletter', 'footer', 'copyright', 'contact', 'facebook']
+        for tag in soup.find_all(True):
             try:
-                # Check classes
-                classes = tag.get("class", [])
-                if isinstance(classes, str): classes = [classes]
-                if any(k in c.lower() for c in classes for k in trash_keywords):
+                if not hasattr(tag, 'attrs') or tag.attrs is None: continue
+                # Check classes AND IDs
+                classes = str(tag.get("class", "")) + " " + str(tag.get("id", ""))
+                
+                if any(k in classes.lower() for k in trash_keywords):
                     tag.decompose()
+            except: pass
+            
+        # C. Remove elements by Text Content (Copyright, etc.)
+        text_trash = ["copyright ©", "all rights reserved", "working days/hours"]
+        for tag in soup.find_all(['div', 'span', 'p', 'footer']):
+            try:
+                txt = tag.get_text().lower()
+                if any(x in txt for x in text_trash) and len(txt) < 300: # Safety: Don't delete long articles
+                     # Only delete if it seems like a footer block (short text)
+                     tag.decompose()
             except: pass
             
         # C. Focus on Main Content (if available) - This eliminates 90% of wrapper trash
@@ -442,20 +484,22 @@ def load_web_with_images(url):
         # FINAL CLEAN: Remove Markdown Bolding (User Request)
         full_content = full_content.replace("**", "").replace("__", "")
         
-        # --- Log Scraped Content ---
-        try:
-            log_dir = Path("log")
-            log_dir.mkdir(parents=True, exist_ok=True)
-            # Create simple filename
-            sanitized_name = url.replace("https://", "").replace("http://", "").replace("/", "_").replace(":", "")[:50]
-            log_file = log_dir / f"web_scraped_{sanitized_name}_{uuid.uuid4().hex[:6]}.txt"
-            
-            with open(log_file, "w", encoding="utf-8") as f:
-                f.write(full_content)
-            print(f"      📝 Scraped content saved to: {log_file}")
-        except Exception as e:
-            print(f"      ⚠️ Failed to save web log: {e}")
+        # --- Log Scraped Content (DISABLED) ---
+        # try:
+        #     log_dir = Path("log")
+        #     log_dir.mkdir(parents=True, exist_ok=True)
+        #     # Create simple filename
+        #     sanitized_name = url.replace("https://", "").replace("http://", "").replace("/", "_").replace(":", "")[:50]
+        #     log_file = log_dir / f"web_scraped_{sanitized_name}_{uuid.uuid4().hex[:6]}.txt"
+        #     
+        #     with open(log_file, "w", encoding="utf-8") as f:
+        #         f.write(full_content)
+        #     print(f"      📝 Scraped content saved to: {log_file}")
+        # except Exception as e:
+        #     print(f"      ⚠️ Failed to save web log: {e}")
         # ---------------------------
+        
+        print(f"   ✅ CRAWLED: {url}")
         
         # 3. Determine Best Image (Cover) for the UI
         best_image_path = "default.jpg"

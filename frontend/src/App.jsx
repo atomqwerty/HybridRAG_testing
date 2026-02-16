@@ -256,13 +256,43 @@ function App() {
         return () => clearInterval(interval);
     }, [isIngesting]);
 
-    // Helper to parse bold (**text**)
+    // Helper to parse bold (**text**) AND images (![alt](src))
     const processInlineMarkdown = (text) => {
-        const parts = text.split(/(\*\*.*?\*\*)/g);
+        // Regex to split by bold OR image
+        // Group 1: **bold**
+        // Group 2: ![alt](src)
+        const parts = text.split(/(\*\*.*?\*\*)|(!\[.*?\]\(.*?\))/g);
+
         return parts.map((part, index) => {
+            if (!part) return null;
+
+            // Bold
             if (part.startsWith('**') && part.endsWith('**')) {
                 return <strong key={index}>{part.slice(2, -2)}</strong>;
             }
+
+            // Image
+            if (part.match(/^!\[(.*?)\]\((.*?)\)$/)) {
+                const match = part.match(/^!\[(.*?)\]\((.*?)\)$/);
+                const alt = match[1];
+                const src = match[2];
+                return (
+                    <img
+                        key={index}
+                        src={src}
+                        alt={alt}
+                        onClick={() => openLightbox(src)}
+                        style={{
+                            maxWidth: '100%',
+                            borderRadius: '8px',
+                            cursor: 'pointer',
+                            margin: '5px 0',
+                            display: 'block'
+                        }}
+                    />
+                );
+            }
+
             return part;
         });
     };
@@ -302,7 +332,7 @@ function App() {
                         const liText = line.trim().substring(1).trim();
                         formatted.push(<li key={idx}>{processInlineMarkdown(liText)}</li>);
                     }
-                    // Normal text
+                    // Normal text + Inline Images
                     else {
                         formatted.push(<div key={idx}>{processInlineMarkdown(line)}</div>);
                     }

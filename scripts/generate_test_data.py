@@ -86,7 +86,7 @@ def main():
     # But user asked to MAKE 100 questions, implying overwriting or filling up.
     # We will overwrite to ensure clean slate or append? Let's overwrite for now or check.
     
-    target_count = 100
+    target_count = 30
     logger.info(f"Target: Generating {target_count} QA pairs from {len(target_files)} files...")
 
     for pdf_path in target_files:
@@ -115,7 +115,12 @@ def main():
                     # Clean quotes
                     q = q.replace('"', '').replace("'", "")
                     a = a.replace('"', '').replace("'", "")
-                    all_qa.append({"Question": q, "Ground Truth": a})
+                    all_qa.append({
+                        "Question": q, 
+                        "Ground Truth": a, 
+                        "Context": text, # Store actual text for NLI evaluation
+                        "source": os.path.basename(pdf_path)
+                    })
                     logger.info(f"    + Q: {q}")
                 
                 logger.info(f"  Total collected: {len(all_qa)}")

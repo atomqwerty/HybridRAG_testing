@@ -36,6 +36,7 @@ def test_retrieval(query):
             for i, res in enumerate(kw_results):
                 # Print full text to see context stitching
                 print(f"\n[{i+1}] Score: {res['score']:.4f} | Source: {res.get('source')}")
+                print(f"    🖼️ Image Path: {res.get('image_path')}")
                 print(f"    Text Preview (len={len(res['text'])}): {res['text'][:300].replace(chr(10), ' ')}...")
                 if len(res['text']) > 500: # Assumption: Single chunk < 500 usually
                      print("    ✅ Likely Stitched Context (Text is long)")

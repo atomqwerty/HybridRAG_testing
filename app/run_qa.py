@@ -1,7 +1,7 @@
 import os
 import re
 from PIL import Image
-from langchain_neo4j import Neo4jGraph
+from langchain_community.graphs import Neo4jGraph
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from database import get_db_connection, create_fulltext_index, create_vector_index
 
@@ -154,13 +154,14 @@ def vector_retrieve(graph, embeddings, question, k=10, min_score=0.5, route="fas
         WITH node, score, 
              coalesce(prev2.text + '\n', '') + coalesce(prev.text + '\n', '') + 
              node.text + 
-             coalesce('\n' + next.text, '') + coalesce('\n' + next2.text, '') AS full_context
+             coalesce('\n' + next.text, '') + coalesce('\n' + next2.text, '') AS full_context,
+             head([n_path IN [node.image_path, prev.image_path, next.image_path, prev2.image_path, next2.image_path] WHERE n_path IS NOT NULL AND n_path <> '' | n_path]) as best_image_path
         
         // Boost score for sorting if Visual Intent and Node is Vision
-        WITH node, score, full_context,
+        WITH node, score, full_context, best_image_path,
              (score + CASE WHEN node.modality = 'vision' OR node.modality = 'hybrid_vision' THEN $boost ELSE 0 END) AS final_score
 
-        RETURN full_context AS text, node.source AS source, node.page AS page, node.image_path AS image_path, final_score AS score
+        RETURN full_context AS text, node.source AS source, node.page AS page, best_image_path AS image_path, final_score AS score
         ORDER BY final_score DESC
     """, {"embedding": q_embedding, "k": k, "min_score": min_score, "boost": visual_boost})
     
@@ -190,15 +191,14 @@ def keyword_retrieve(graph, question, k=5):
     if not terms:
         return []
         
-    # Relaxed Logic: Use OR for broad recall, let Lucene scoring handle relevance.
-    # AND is too strict for long natural language queries.
-    # Filter: must be at least 2 chars AND contain at least one alphanumeric char
-    lucene_query = " OR ".join([f"{t}~" for t in terms if len(t) >= 2 and re.search(r'[\w\u0E00-\u0E7F0-9]', t)])
+    # Stricter Logic: Use AND for precision. If specific keywords are typed, we want ALL of them.
+    # Vector Search handles semantic/fuzzy recall.
+    lucene_query = " AND ".join([f"{t}~" for t in terms if len(t) >= 2 and re.search(r'[\w\u0E00-\u0E7F0-9]', t)])
     
     if not lucene_query:
         return []
         
-    logger.info(f"Keyword Search Query (Relaxed): {lucene_query}")
+    logger.info(f"Keyword Search Query (Strict): {lucene_query}")
     
     query = """
         CALL db.index.fulltext.queryNodes("chunk_text_index", $query, {limit: $k})
@@ -216,10 +216,11 @@ def keyword_retrieve(graph, question, k=5):
         ORDER BY chunk.seq
         
         // Concatenate
-        WITH node, score, collect(chunk.text) as all_texts
-        WITH node, score, reduce(s = '', text IN all_texts | s + '\\n' + text) as full_page_context
+        WITH node, score, collect(chunk.text) as all_texts, 
+             head([c IN collect(chunk) WHERE c.image_path IS NOT NULL AND c.image_path <> '' | c.image_path]) as found_image
+        WITH node, score, reduce(s = '', text IN all_texts | s + '\\n' + text) as full_page_context, found_image
         
-        RETURN full_page_context as text, node.source as source, node.page as page, node.image_path as image_path, score
+        RETURN full_page_context as text, node.source as source, node.page as page, found_image as image_path, score
         """
     
     try:
@@ -249,7 +250,7 @@ def reciprocal_rank_fusion(results_lists, k=60):
     reranked_results.sort(key=lambda x: x['rrf_score'], reverse=True)
     return reranked_results
 
-def hybrid_context(graph, embeddings, question, llm_model, route="fast_fact"):
+def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact"):
     """Combines Graph, Vector, and Keyword context. Adapts to Route."""
     create_fulltext_index(graph)
     create_chunk_fulltext_index(graph)
@@ -317,16 +318,33 @@ def hybrid_context(graph, embeddings, question, llm_model, route="fast_fact"):
             pg = row.get('page', '?')
             if src and os.path.sep in str(src):
                 src = str(src).split(os.path.sep)[-1]
-            context += f"- {row['text']} [Source: {src}, Page: {pg}]\n"
+            text = str(row['text'])
+            # Clean HTML tags more aggressively (including encoded)
+            text = str(text).replace('&lt;', '<').replace('&gt;', '>')
+            text = re.sub(r'<[^>]+>', ' ', text)
+            context += f"- {text} [Source: {src}, Page: {pg}]\n"
             
             # Logic to deduplicate images
             img_p = row.get('image_path')
-            if img_p and img_p not in seen_images:
-                context += f" [IMAGE PATH: {img_p}]\n"
-                seen_images.add(img_p)
-            elif str(src).lower().endswith(('.jpg', '.jpeg', '.png', '.webp')) and src not in seen_images:
-                context += f" [IMAGE PATH: {src}]\n"
-                seen_images.add(src)
+            if img_p:
+                if not img_p.startswith('/images/') and not img_p.startswith('http'):
+                     # Ensure we don't double prepend if path includes subdir
+                     # Assuming basic file serving pattern
+                     img_p = f"/images/{img_p.lstrip('/')}"
+                
+                if img_p not in seen_images:
+                    context += f" [IMAGE PATH: {img_p}]\n"
+                    logger.info(f"Adding Image Path to Context: {img_p}")
+                    seen_images.add(img_p)
+            elif str(src).lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                # Fallback for image-only chunks if path is missing
+                img_src = src
+                if not img_src.startswith('/images/') and not img_src.startswith('http'):
+                    img_src = f"/images/{img_src.lstrip('/')}"
+                
+                if img_src not in seen_images:
+                    context += f" [IMAGE PATH: {img_src}]\n"
+                    seen_images.add(img_src)
             if '[IMAGE' in row['text']:
                 context += "  (👆 THIS IS CONTENT EXTRACTED FROM AN INFOGRAPHIC/IMAGE. TREAT AS RELIABLE DATA.)\n"
     else:
@@ -437,7 +455,11 @@ def answer(question, history="", temperature=0.3):
     
     standalone_question = question
     if history:
-        condense_template = "Given history: {history}. Rephrase follow-up: {question} to standalone."
+        condense_template = """Given chat history and follow-up, rephrase to standalone question.
+        IMPORTANT: Preserve any specific model numbers or names (e.g. 009, Atto 3, Model Y). DO NOT generalize "Zeekr 009" to just "Zeekr".
+        Chat History: {history}
+        Follow Up: {question}
+        Standalone:"""
         condense_prompt = ChatPromptTemplate.from_template(condense_template)
         standalone_question = dynamic_llm.invoke(condense_prompt.format(history=history, question=question)).content
         logger.info(f"Rewritten: {standalone_question}")
@@ -446,29 +468,80 @@ def answer(question, history="", temperature=0.3):
     route = get_route(standalone_question)
     logger.info(f"🚀 Query Route: {route}")
 
-    # Lazy Connect
-    try:
-        graph = get_graph()
-    except Exception as e:
-        logger.error(f"Cannot connect to DB: {e}")
-        return {"result": "⚠️ System Initializing... Please wait 10 seconds and try again.", "context": ""}
+    # Lazy Connect with Retry Loop
+    graph = None
+    import time
+    for attempt in range(3):
+        try:
+            graph = get_graph()
+            if graph:
+                logger.info(f"Connection Successful (Attempt {attempt+1})")
+                break
+        except Exception as e:
+            logger.warning(f"Connection Failed (Attempt {attempt+1}): {e}")
+            time.sleep(2)
+    
+    if not graph:
+        return {"result": "⚠️ System Initializing... Please wait 5 seconds and try again.", "context": ""}
 
     context = hybrid_context(graph, embeddings, standalone_question, llm_model=dynamic_llm, route=route)
     
+    # --- DEBUG: Print Context for User to See ---
+    print("\n--- [DEBUG] RETRIEVED CONTEXT ---")
+    print(context)
+    print("--- [DEBUG] END CONTEXT ---\n")
+    # ------------------------------------------
+    
+    
+    # CRITICAL INSTRUCTION AT THE TOP:
     template = """You are an intelligent Thai AI assistant (Hybrid RAG).
-Answer based ONLY on context: {context}
-History: {history}
-Question: {question}
+    
+    # 1. AMBIGUITY CHECK (Execute in Order):
+    
+    # 1. AMBIGUITY CHECK (Execute in Order):
+    
+    # 1. AMBIGUITY CHECK (Execute in Order):
+    
+    - RULE 1 [BRAND ONLY]: IF the user mentions ONLY a brand (e.g., "Audi", "Tesla") with NO specific model variant:
+      STOP. 
+      Check the {context} for available models of that brand.
+      Reply ONLY: "ขอทราบรุ่น [Brand Name] ที่ท่านสนใจครับ? (ในระบบมีข้อมูล: [List models found in context])"
+      
+    - RULE 2 [MODEL FOUND / MULTIPLE VERSIONS]: IF the user provides a model (e.g. "Audi e-tron sportback 55") but there are multiple versions (different years/specs):
+      DO NOT STOP.
+      PROCEED to Context Refinement.
+      Instruct the AI to answer using the most relevant data available and mention that there are multiple versions (e.g. "ข้อมูลสำหรับ Audi e-tron sportback 55 รุ่นปี 2019-2020 คือ...").
+      
+    - RULE 3 [MODEL NOT FOUND]: IF the model name provided does not appear in the context at all:
+      STOP.
+      Reply: "ขออภัยครับ ไม่พบข้อมูลสำหรับรุ่น '[User Model]' ในระบบ (รุ่นที่มีข้อมูลคือ: [List valid models from context])"
 
-Route Detected: {route}
-
-Rules:
-- ANSWER IN THAI LANGUAGE ONLY (Respond properly with 'ครับ' or 'ค่ะ').
-- If 'Visual' intent, describe the table/chart details clearly.
-- If 'Deep Reasoning', explain the 'Why' and 'How'.
-- Cite the source page (e.g. [Page 5]).
-- Be polite and professional.
-"""
+    # 2. CONTEXT REFINEMENT (Step-by-Step Thinking):
+    1. **Analyze the Request**: Identify the specific car model or topic.
+    2. **Filter Context**: Scan the retrieved chunks below. IGNORE chunks that do not match the specific model (e.g. if asking for "Zeekr 009", ignore "Zeekr X" or "SCB Report").
+    3. **Extract Facts**: Extract specs, prices, charging info, AND any **[IMAGE PATH: ...]** associated with the filtered chunks.
+    4. **Synthesize Answer**: Answer based on the extracted facts. **CRITICAL**: If an image path was extracted, YOU MUST DISPLAY IT at the end.
+    
+    Context:
+    {context}
+    
+    History: {history}
+    Question: {question}
+    
+    Rules:
+     - ANSWER IN THAI LANGUAGE ONLY (Respond properly with 'ครับ' or 'ค่ะ').
+     - If 'Visual' intent, describe the table/chart details clearly.
+     - If 'Deep Reasoning', explain the 'Why' and 'How'.
+     - Cite the source page (e.g. [Page 5]).
+     - If an [IMAGE PATH: ...] is provided:
+        - Extract the FILENAME from the path (e.g. "image.jpg" from "https://example.com/image.jpg").
+        - DISPLAY IT using Markdown syntax: ![Image](/images/<filename>)
+        - (Example: ![Image](/images/audi-e-tron.jpg))
+     - DO NOT SAY "Here is the image". JUST OUTPUT THE MARKDOWN.
+    - If you don't know the answer or the context is insufficient, say "ขออภัยครับ ข้อมูลในระบบยังมีไม่เพียงพอ" and ask specific clarifying questions.
+    - If the user's intent is unclear, ask for clarification (e.g. "หมายถึงรุ่นไหนครับ?").
+    - Be polite and professional.
+    """
     prompt = ChatPromptTemplate.from_template(template)
     final_chain = (prompt | dynamic_llm | StrOutputParser())
     
