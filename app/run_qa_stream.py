@@ -42,75 +42,73 @@ def answer_stream(question, history="", temperature=0.3):
         # We don't stream the rewrite, just await it
         standalone_question = dynamic_llm.invoke(condense_prompt.format(history=history, question=question)).content
     
-    # --- Step 2: Retrieve ---
-    # This is the blocking part (2-3s)
-    graph = None
-    import time
-    for attempt in range(3):
-        try:
-            graph = get_graph()
-            if graph:
-                print(f"[INFO] Connection Successful (Attempt {attempt+1})")
-                break
-        except Exception as e:
-            print(f"[WARN] Connection Failed (Attempt {attempt+1}): {e}")
-            time.sleep(2)
-    
-    if not graph:
-        yield json.dumps({"type": "token", "content": "System Initializing... Please wait 5 seconds and try again."}) + "\n"
-        return
-
-    context = hybrid_context(graph, embeddings, standalone_question, llm_model=dynamic_llm)
-    
-    # Parse sources for frontend
-    sources = []
-    seen_sources = set()
-    matches = re.findall(r"\[Source: (.*?), Page: (.*?)\]", context)
-    for src, pg in matches:
-        if (src, pg) not in seen_sources:
-            sources.append({"file": src, "page": pg})
-            seen_sources.add((src, pg))
+    # --- Step 2: Invoke LangGraph ---
+    # We use the compiled graph to retrieve, grade, and generate
+    try:
+        from graph_agent import app_graph
         
-    # Find images
-    images = []
-    img_matches = re.findall(r"\[IMAGE PATH: (.*?)\]", context)
-    for p in img_matches:
-        img_name = os.path.basename(p)
-        images.append(img_name)
-    
-    # YIELD METADATA
-    yield json.dumps({
-        "type": "meta", 
-        "sources": sources, 
-        "images": images,
-        "debug_context": context 
-    }) + "\n"
-    
-    # --- Step 3: Generate Stream ---
-    # CRITICAL INSTRUCTION AT THE TOP:
-    template = """You are an intelligent Thai AI assistant (Hybrid RAG).
-    
-    # 1. AMBIGUITY CHECK (Execute in Order):
-    
-    - RULE 1 [BRAND ONLY]: IF the user mentions ONLY a brand (e.g., "Audi", "Tesla") with NO specific model variant:
-      STOP. 
-      Check the {context} for available models of that brand.
-      Reply ONLY: "ขอทราบรุ่น [Brand Name] ที่ท่านสนใจครับ? (ในระบบมีข้อมูล: [List models found in context])"
-      
-    - RULE 2 [MODEL FOUND / MULTIPLE VERSIONS]: IF the user provides a model (e.g. "Audi e-tron sportback 55") but there are multiple versions (different years/specs):
-      DO NOT STOP.
-      PROCEED to Context Refinement.
-      Instruct the AI to answer using the most relevant data available and mention that there are multiple versions (e.g. "ข้อมูลสำหรับ Audi e-tron sportback 55 รุ่นปี 2019-2020 คือ...").
-      
-    - RULE 3 [MODEL NOT FOUND]: IF the model name provided does not appear in the context at all:
-      STOP.
-      Reply: "ขออภัยครับ ไม่พบข้อมูลสำหรับรุ่น '[User Model]' ในระบบ (รุ่นที่มีข้อมูลคือ: [List valid models from context])"
+        inputs = {
+            "question": standalone_question,
+            "documents": [],
+            "iterations": 0
+        }
+        
+        # Invoke Graph (Blocking for now)
+        # Note: Future improvement - use app_graph.stream() for real-time events
+        final_state = app_graph.invoke(inputs)
+        
+        documents = final_state.get("documents", [])
+        generation = final_state.get("generation", "")
+        graph_ctx = final_state.get("graph_context", "")
 
-    # 2. CONTEXT REFINEMENT (Step-by-Step Thinking):
-    1. **Analyze the Request**: Identify the specific car model or topic.
-    2. **Filter Context**: Scan the retrieved chunks below. IGNORE chunks that do not match the specific model (e.g. if asking for "Zeekr 009", ignore "Zeekr X" or "SCB Report").
-    3. **Extract Facts**: Extract specs, prices, charging info, AND any **[IMAGE PATH: ...]** associated with the filtered chunks.
-    4. **Synthesize Answer**: Answer based on the extracted facts. **CRITICAL**: If an image path was extracted, YOU MUST DISPLAY IT at the end.
+        # --- Step 3: Yield Metadata ---
+        sources = []
+        seen_sources = set()
+        images = []
+        seen_images = set()
+
+        for doc in documents:
+            meta = doc.metadata
+            src = meta.get('source', '')
+            pg = meta.get('page', '')
+            
+            # Source
+            if src:
+                s_key = (src, pg)
+                if s_key not in seen_sources:
+                    base_name = os.path.basename(src)
+                    if not any(base_name.lower().endswith(ext) for ext in ['.jpg', '.png', '.jpeg']):
+                        sources.append({"file": base_name, "page": pg})
+                        seen_sources.add(s_key)
+            
+            # Image
+            img = meta.get('image_path', '')
+            if img:
+                img_name = os.path.basename(img)
+                if img_name not in seen_images:
+                    images.append(img_name)
+                    seen_images.add(img_name)
+        
+        # Parse extra images from graph context if any? 
+        # (Our Retrieve node puts them in doc metadata, so strictly speaking we are good)
+        
+        yield json.dumps({
+            "type": "meta", 
+            "sources": sources, 
+            "images": images,
+            "debug_context": graph_ctx 
+        }) + "\n"
+        
+        # --- Step 4: Stream Generation (Simulated) ---
+        chunk_size = 20
+        for i in range(0, len(generation), chunk_size):
+             yield json.dumps({"type": "token", "content": generation[i:i+chunk_size]}) + "\n"
+             import time
+             time.sleep(0.02) # Slight delay for effect
+             
+    except Exception as e:
+        print(f"[ERROR] Graph Execution Failed: {e}")
+        yield json.dumps({"type": "error", "content": str(e)}) + "\n"   4. **Synthesize Answer**: Answer based on the extracted facts. **CRITICAL**: If an image path was extracted, YOU MUST DISPLAY IT at the end.
     
     Context:
     {context}

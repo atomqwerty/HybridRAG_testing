@@ -250,12 +250,15 @@ def reciprocal_rank_fusion(results_lists, k=60):
     reranked_results.sort(key=lambda x: x['rrf_score'], reverse=True)
     return reranked_results
 
-def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact"):
-    """Combines Graph, Vector, and Keyword context. Adapts to Route."""
+def retrieve_documents(graph, embeddings, question: str, llm_model, route="fast_fact"):
+    """
+    Retrieves raw documents (Vector + Graph + Keyword). 
+    Returns: (vector_ctx: List[Dict], graph_ctx: str)
+    """
     create_fulltext_index(graph)
     create_chunk_fulltext_index(graph)
     
-    # 1. GRAPH SEARCH (Boosted if deep_reasoning)
+    # 1. GRAPH SEARCH
     graph_limit = 30 if route == "deep_reasoning" else 15
     graph_ctx = retrieve_graph_context(graph, llm_model, question, limit=graph_limit)
 
@@ -263,9 +266,8 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
     keyword_ctx = keyword_retrieve(graph, question, k=15)
     logger.info(f"📊 Keyword Retrieval: {len(keyword_ctx)} results")
     
-    # Vector Search (Multi-Query)
+    # Vector Search
     queries_to_run = [question]
-    # Only multi-query if NOT visual (visual needs precise single query usually)
     if route != "visual_layout":
         try:
             if len(question) > 10 and llm_model:
@@ -278,34 +280,31 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
 
     vector_results_map = {}
     for q in queries_to_run:
-        # Pass route to vector_retrieve for boosting
         res = vector_retrieve(graph, embeddings, q, k=10, min_score=0.50, route=route)
         for r in res:
             vector_results_map[r['text']] = r 
             
     vector_ctx = list(vector_results_map.values())
     vector_ctx.sort(key=lambda x: x.get('score', 0), reverse=True)
-    logger.info(f"📊 Vector Retrieval: {len(vector_ctx)} results")
     
     combined_results = reciprocal_rank_fusion([keyword_ctx, vector_ctx])
     vector_ctx = combined_results
-    logger.info(f"📊 After RRF Fusion: {len(vector_ctx)} results")
 
     # Re-rank
     if vector_ctx:
-        # Separate images
         is_img_file = lambda r: r.get('source', '').lower().endswith(('.jpg', '.jpeg', '.png'))
         image_file_results = [r for r in vector_ctx if is_img_file(r)]
         text_results = [r for r in vector_ctx if not is_img_file(r)]
-        
-        # Merge back for reranking
         vector_ctx = text_results + image_file_results
         
         reranked = rerank_results(question, vector_ctx, top_k=10, method=Config.RERANKER_METHOD, llm_model=llm_model)
         vector_ctx = reranked
         logger.info(f"📊 After Reranking (top_k=10): {len(vector_ctx)} results")
-        if vector_ctx:
-            logger.info(f"📄 First result preview: {vector_ctx[0]['text'][:300]}...")
+        
+    return vector_ctx, graph_ctx
+
+def format_context(vector_ctx, graph_ctx):
+    """Formats raw documents into the context string for LLM."""
 
     context = "### GRAPH KNOWLEDGE BITS:\n"
     context += graph_ctx if graph_ctx else "No direct entity facts found.\n"
@@ -351,6 +350,11 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
         context += "SYSTEM NOTE: No direct data matches found.\n"
 
     return context
+
+def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact"):
+    """Backwards compatibility wrapper."""
+    vector_ctx, graph_ctx = retrieve_documents(graph, embeddings, question, llm_model, route)
+    return format_context(vector_ctx, graph_ctx)
 
 # --- TRUST SCORE LOGIC ---
 TRUST_CONFIG = {}

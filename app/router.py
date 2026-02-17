@@ -157,8 +157,12 @@ class ThaiRouter:
                 
         return "fast_fact"
 
-# Global Instance
-global_router = ThaiRouter()
+# Global Instance (Lazy)
+global_router = None
 
 def get_route(query):
+    global global_router
+    if global_router is None:
+        logger.info("Initializing Lazy Router...")
+        global_router = ThaiRouter()
     return global_router.route(query)
