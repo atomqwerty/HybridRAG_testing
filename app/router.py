@@ -1,7 +1,7 @@
 import os
 from typing import List, Optional
-from config import Config
-from logger import setup_logger
+from app.config import Config
+from app.logger import setup_logger
 
 logger = setup_logger(__name__)
 

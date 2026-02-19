@@ -59,4 +59,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
 # Run API
-CMD ["python", "app/api.py"]
+CMD ["python", "main.py"]

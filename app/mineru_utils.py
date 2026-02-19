@@ -4,7 +4,7 @@ import fitz  # PyMuPDF
 import glob
 import shutil
 import uuid
-from logger import setup_logger
+from app.logger import setup_logger
 
 logger = setup_logger(__name__)
 

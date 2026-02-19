@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 # Import from run_qa to reuse Graph/Retrieval logic
 # Import from run_qa (graph global removed, use get_graph)
-from run_qa import get_graph, embeddings, hybrid_context
+from app.run_qa import get_graph, embeddings, hybrid_context
 
 load_dotenv()
 

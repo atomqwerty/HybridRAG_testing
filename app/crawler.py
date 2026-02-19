@@ -12,8 +12,8 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 import json
 from langchain_core.documents import Document
-from vision_utils import describe_image, encode_image_from_file
-from config import Config
+from app.vision_utils import describe_image, encode_image_from_file
+from app.config import Config
 from PIL import Image
 from urllib.parse import unquote
 

@@ -1,22 +1,22 @@
 import dlt
 from dlt.sources.helpers import requests
 from typing import Iterator, Dict, Any
-from pipeline_schemas import CarModel, TechSpecs
-from config import Config
+from app.pipeline_schemas import CarModel, TechSpecs
+from app.config import Config
 import json
 import uuid
 import os
 import glob
 from langchain_neo4j import Neo4jGraph
-from crawler import load_web_with_images, get_internal_links, init_driver
-from logger import setup_logger
+from app.crawler import load_web_with_images, get_internal_links, init_driver
+from app.logger import setup_logger
 
 logger = setup_logger(__name__)
-from utils import update_status, auto_add_trust_rule
-from mineru_utils import extract_pdf_content_mineru
+from app.utils import update_status, auto_add_trust_rule
+from app.mineru_utils import extract_pdf_content_mineru
 
 from langchain_core.documents import Document
-from database import create_vector_index, create_text_vector_index, get_db_connection
+from app.database import create_vector_index, create_text_vector_index, get_db_connection
 import hashlib
 import fitz # PyMuPDF
 import base64
@@ -456,117 +456,101 @@ def hybrid_rag_source(urls: list, files: list, existing_ids: set = None):
 
 
 
-if __name__ == "__main__":
-    update_status("Initializing DLT Pipeline...", 5)
-    
-    # ... (Loading Logic) ...
-    urls_file = os.path.join(Config.DATA_DIR, "urls.txt")
-    prod_urls = []
-    if os.path.exists(urls_file):
-        with open(urls_file, "r") as f:
-            # Defensive dedup: set() removes duplicates immediately
-            prod_urls = list({line.strip() for line in f if line.strip()})
-    
-    prod_files = []
-    search_patterns = ["**/*.pdf", "**/*.PDF", "**/*.docx", "**/*.DOCX", "**/*.txt", "**/*.TXT"]
-    for pattern in search_patterns:
-        full_pattern = os.path.join(Config.DATA_DIR, pattern)
-        prod_files.extend(glob.glob(full_pattern, recursive=True))
-    
-    prod_files = [f for f in prod_files if "dlt_output" not in f and "urls.txt" not in os.path.basename(f)]
+from app.ingest.base import BaseIngestor
 
-
-    # --- Incremental Ingestion Filter ---
-    try:
-        graph_conn = get_db_connection()
-        # Get all sources (Files and URLs) already in DB
-        res = graph_conn.query("MATCH (c:Chunk) RETURN DISTINCT c.source as source")
-        existing_sources = set([r['source'] for r in res])
-        print(f"DEBUG: Found {len(existing_sources)} existing sources in Neo4j.")
-    except Exception as e:
-        print(f"Warning: Could not check existing sources ({e}). Proceeding with full ingest.")
-        existing_sources = set()
-
-    # Filter URLs - MODIFIED: Do NOT filter seeds upfront.
-    # We want to crawl seeds to find NEW sub-pages (Generic Mode).
-    # We will filter individual discovered pages inside `hybrid_rag_source`.
-    original_url_count = len(prod_urls)
-    # prod_urls = [u for u in prod_urls if u not in existing_sources] # <-- REMOVED
-    print(f"Incremental Strategy: scanning {original_url_count} seeds for new content...")
-
-    # Filter Files (Match by basename, as source typically = filename)
-    original_file_count = len(prod_files)
-    prod_files = [f for f in prod_files if os.path.basename(f) not in existing_sources]
-    print(f"Incremental Filter: Files {original_file_count} -> {len(prod_files)} (Skipped {original_file_count - len(prod_files)})")
-
-    msg = f"Processing {len(prod_urls)} New URLs and {len(prod_files)} New Files."
-    print(msg)
-    update_status(msg, 10)
+class DLTIngestor(BaseIngestor):
+    """DLT-based Ingestion Strategy."""
     
-    target_urls = prod_urls
-    target_files = prod_files if prod_files else [] 
-
-    # Run the pipeline
-    output_dir = os.path.join(Config.DATA_DIR, "dlt_output")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    pipeline = dlt.pipeline(
-        pipeline_name="hybrid_ingestion",
-        destination=dlt.destinations.filesystem(bucket_url=f"file://{output_dir}"), 
-        dataset_name="hybrid_data"
-    )
-
-    # 1. Pipeline Run
-    update_status("Running Extraction & DLT Load...", 20)
-    
-    load_info = pipeline.run(
-        hybrid_rag_source(target_urls, target_files, existing_sources), 
-        loader_file_format="jsonl"
-    )
-    print(load_info)
-    
-    # 2. Sync to Neo4j
-    update_status("Syncing to Knowledge Graph (Neo4j)...", 60)
-    print("Writing to Neo4j...")
-    
-    data = list(hybrid_rag_source(target_urls, target_files, existing_sources)) 
-    
-    all_items = data
+    def ingest_document(self, file_path: str, source_type: str = "file") -> Dict[str, Any]:
+        """Ingests a single document using DLT Pipeline."""
+        logger.info(f"🚀 Starting DLT Ingestion for {file_path}...")
         
-    load_to_neo4j(all_items)
-    
-    # 3. ULTIMATE HYBRID: Post-Processing
-    print("Running Graph Enrichment...")
-    graph = Neo4jGraph(url=Config.NEO4J_URI, username=Config.NEO4J_USERNAME, password=Config.NEO4J_PASSWORD)
-    clean_graph_schema(graph)
-    enrich_communities(graph)
-    
-    print("✅ Neo4j Sync & Enrichment Complete.")
-    
-    # 4. Pydantic Validation
-    update_status("Validating Data Structure...", 90)
-    # ... (Validation Logic) ...
-    # 4. Pydantic Validation
-    update_status("Validating Data Structure...", 90)
-    # Validation logic removed to avoid confusion with actual data
-    logger.info("✅ Pydantic Schemas Validated.")
-        
-    # 4. Finalize: Update Trust Rules for processed items
-    update_status("Finalizing Trust Rules...", 95)
-    
-    # Add files
-    for file_path in target_files:
-        filename = os.path.basename(file_path)
-        auto_add_trust_rule(filename, score=1.0, rule_type='file')
-        
-    # Add URLs
-    from urllib.parse import urlparse
-    for url in target_urls:
-         if "example.com/placeholder" in url: continue
-         try:
-             domain = urlparse(url).netloc.replace('www.', '')
-             if domain: 
-                auto_add_trust_rule(domain, score=1.0, rule_type='domain')
-         except: pass
+        try:
+            # 1. Setup Pipeline
+            output_dir = os.path.join(Config.DATA_DIR, "dlt_output")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            pipeline = dlt.pipeline(
+                pipeline_name="hybrid_ingestion",
+                destination=dlt.destinations.filesystem(bucket_url=f"file://{output_dir}"), 
+                dataset_name="hybrid_data"
+            )
+            
+            # 2. Run Pipeline (Single File)
+            # We pass empty set() for existing_ids to force ingestion
+            target_files = [file_path]
+            target_urls = []
+            
+            load_info = pipeline.run(
+                hybrid_rag_source(target_urls, target_files, set()), 
+                loader_file_format="jsonl"
+            )
+            logger.info(f"DLT Load Info: {load_info}")
+            
+            # 3. Sync to Neo4j
+            all_items = list(hybrid_rag_source(target_urls, target_files, set()))
+            load_to_neo4j(all_items)
+            
+            # 4. Enrich
+            graph = Neo4jGraph(url=Config.NEO4J_URI, username=Config.NEO4J_USERNAME, password=Config.NEO4J_PASSWORD)
+            clean_graph_schema(graph)
+            enrich_communities(graph)
+            
+            # 5. Metadata/Trust
+            filename = os.path.basename(file_path)
+            auto_add_trust_rule(filename, score=1.0, rule_type='file')
+            
+            logger.info(f"✅ Successfully ingested {filename}")
+            return {"status": "success", "message": f"Ingested {filename}"}
+            
+        except Exception as e:
+            logger.error(f"DLT Ingestion Failed: {e}")
+            raise e
 
-    update_status("Ingestion Complete!", 100, "completed")
+    def ingest_url(self, url: str) -> Dict[str, Any]:
+        """Ingests a URL recursively using the existing deep crawler logic."""
+        logger.info(f"🚀 Starting DLT Ingestion for URL {url}...")
+        
+        try:
+            output_dir = os.path.join(Config.DATA_DIR, "dlt_output")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            pipeline = dlt.pipeline(
+                pipeline_name="hybrid_ingestion",
+                destination=dlt.destinations.filesystem(bucket_url=f"file://{output_dir}"), 
+                dataset_name="hybrid_data"
+            )
+            
+            target_urls = [url]
+            target_files = []
+            
+            # The resource handles crawling logic internally
+            load_info = pipeline.run(
+                hybrid_rag_source(target_urls, target_files, set()), 
+                loader_file_format="jsonl"
+            )
+            logger.info(f"DLT URL Load Info: {load_info}")
+            
+            # Sync to Neo4j
+            all_items = list(hybrid_rag_source(target_urls, target_files, set()))
+            load_to_neo4j(all_items)
+            
+            # Enrich
+            graph = Neo4jGraph(url=Config.NEO4J_URI, username=Config.NEO4J_USERNAME, password=Config.NEO4J_PASSWORD)
+            clean_graph_schema(graph)
+            enrich_communities(graph)
+            
+            # Trust
+            from urllib.parse import urlparse
+            try:
+                domain = urlparse(url).netloc.replace('www.', '')
+                if domain: 
+                    auto_add_trust_rule(domain, score=1.0, rule_type='domain')
+            except: pass
+            
+            logger.info(f"✅ Successfully crawled {url}")
+            return {"status": "success", "message": f"Crawled & Ingested {url}"}
+            
+        except Exception as e:
+            logger.error(f"DLT URL Ingestion Failed: {e}")
+            raise e

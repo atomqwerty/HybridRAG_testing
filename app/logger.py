@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
-from config import Config
+from app.config import Config
 
 def setup_logger(name=__name__):
     """

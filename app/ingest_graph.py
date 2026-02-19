@@ -13,11 +13,11 @@ from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_core.documents import Document
 
-from config import Config
-from logger import setup_logger
-from database import get_db_connection, create_vector_index, create_fulltext_index, get_existing_sources
-from vision_utils import describe_image, encode_image_from_file
-from crawler import get_internal_links, get_links_from_sitemap, load_web_with_images
+from app.config import Config
+from app.logger import setup_logger
+from app.database import get_db_connection, create_vector_index, create_fulltext_index, get_existing_sources
+from app.vision_utils import describe_image, encode_image_from_file
+from app.crawler import get_internal_links, get_links_from_sitemap, load_web_with_images
 
 logger = setup_logger(__name__)
 
