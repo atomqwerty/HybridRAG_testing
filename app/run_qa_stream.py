@@ -124,9 +124,9 @@ def answer_stream(question, history="", temperature=0.3):
     - If 'Deep Reasoning', explain the 'Why' and 'How'.
     - Cite the source page (e.g. [Page 5]).
     - If an [IMAGE PATH: ...] is provided:
-       - Extract the FILENAME from the path (e.g. "image.jpg" from "https://example.com/image.jpg").
-       - DISPLAY IT using Markdown syntax: ![Image](/images/<filename>)
-       - (Example: ![Image](/images/audi-e-tron.jpg))
+       - Extract the FILENAME from the path (e.g. "image.jpg" from "/api/images/image.jpg").
+       - DISPLAY IT using Markdown syntax: ![Image](/api/images/<filename>)
+       - (Example: ![Image](/api/images/audi-e-tron.jpg))
     - DO NOT SAY "Here is the image". JUST OUTPUT THE MARKDOWN.
     - If you don't know the answer or the context is insufficient, say "ขออภัยครับ ข้อมูลในระบบยังมีไม่เพียงพอ" and ask specific clarifying questions.
     - If the user's intent is unclear, ask for clarification (e.g. "หมายถึงรุ่นไหนครับ?").

@@ -17,22 +17,18 @@ from app.router import get_route
 
 logger = setup_logger(__name__)
 
-# Thai Text Preprocessing Helper
-def preprocess_thai_query(question):
-    """Tokenizes Thai text to add spaces between words for better search."""
+def preprocess_thai_query(query: str) -> str:
+    """Tokenizes Thai text for better Lucene search."""
     try:
-        from pythainlp import word_tokenize
-        import re
         # Detect if query contains Thai characters (Unicode range \u0E00-\u0E7F)
-        if re.search(r'[\u0E00-\u0E7F]', question):
-            # Tokenize Thai text to add spaces between words
-            tokenized = word_tokenize(question, engine='newmm')
-            result = ' '.join(tokenized)
-            logger.info(f"Thai Tokenization: {question[:50]}... -> {result[:50]}...")
-            return result
+        if any('\u0E00' <= char <= '\u0E7F' for char in query):
+            from pythainlp import word_tokenize
+            tokens = word_tokenize(query, engine="newmm")
+            return " ".join(tokens)
+        return query
     except Exception as e:
         logger.warning(f"Thai tokenization failed: {e}")
-    return question
+        return query
 
 # 1. Connect to Neo4j
 # 1. Connect to Neo4j
@@ -51,7 +47,7 @@ def get_graph():
         
         # Create Indices on first connect
         create_vector_index(_GRAPH, dimensions=Config.EMBEDDING_DIMENSION) 
-        from database import create_text_vector_index
+        from app.database import create_text_vector_index
         create_text_vector_index(_GRAPH, dimensions=3072)
         create_fulltext_index(_GRAPH)
         
@@ -193,7 +189,18 @@ def keyword_retrieve(graph, question, k=5):
         
     # Stricter Logic: Use AND for precision. If specific keywords are typed, we want ALL of them.
     # Vector Search handles semantic/fuzzy recall.
-    lucene_query = " AND ".join([f"{t}~" for t in terms if len(t) >= 2 and re.search(r'[\w\u0E00-\u0E7F0-9]', t)])
+    boosted_terms = []
+    # Identify car brands to boost during retrieval
+    brands = ['xpeng', 'byd', 'tesla', 'audi', 'zeekr', 'deepal', 'bmw', 'mercedes', 'ora', 'geely', 'mg', 'hyundai']
+    for t in terms:
+        if len(t) <= 1: continue
+        # Heavily boost brands to ensure they override generic terms like "battery" or "charging"
+        if t.lower() in brands:
+            boosted_terms.append(f"{t}^5")
+        else:
+            boosted_terms.append(f"{t}~")
+    
+    lucene_query = " OR ".join(boosted_terms)
     
     if not lucene_query:
         return []
@@ -255,12 +262,16 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
     create_fulltext_index(graph)
     create_chunk_fulltext_index(graph)
     
-    # 1. GRAPH SEARCH (Boosted if deep_reasoning)
-    graph_limit = 30 if route == "deep_reasoning" else 15
+    # Detect Brand-Only or short queries (Higher Recall needed)
+    is_broad_query = len(question.strip().split()) <= 2 or any(b.lower() in question.lower() for b in ['xpeng', 'byd', 'tesla', 'audi', 'zeekr'])
+    
+    # 1. GRAPH SEARCH (Boosted if deep_reasoning or broad query)
+    graph_limit = 40 if (route == "deep_reasoning" or is_broad_query) else 15
     graph_ctx = retrieve_graph_context(graph, llm_model, question, limit=graph_limit)
 
     # 2. HYBRID SEARCH
-    keyword_ctx = keyword_retrieve(graph, question, k=15)
+    k_res = 20 if is_broad_query else 15
+    keyword_ctx = keyword_retrieve(graph, question, k=k_res)
     logger.info(f"📊 Keyword Retrieval: {len(keyword_ctx)} results")
     
     # Vector Search (Multi-Query)
@@ -279,7 +290,8 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
     vector_results_map = {}
     for q in queries_to_run:
         # Pass route to vector_retrieve for boosting
-        res = vector_retrieve(graph, embeddings, q, k=10, min_score=0.50, route=route)
+        k_vec = 15 if is_broad_query else 10
+        res = vector_retrieve(graph, embeddings, q, k=k_vec, min_score=0.50, route=route)
         for r in res:
             vector_results_map[r['text']] = r 
             
@@ -327,13 +339,14 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
             # Logic to deduplicate images
             img_p = row.get('image_path')
             if img_p:
-                if not img_p.startswith('/images/') and not img_p.startswith('http'):
+                if not img_p.startswith('/api/images/') and not img_p.startswith('http'):
                      # Ensure we don't double prepend if path includes subdir
                      # Assuming basic file serving pattern
-                     img_p = f"/images/{img_p.lstrip('/')}"
+                     img_p = f"/api/images/{img_p.split('/')[-1]}"
                 
                 if img_p not in seen_images:
                     context += f" [IMAGE PATH: {img_p}]\n"
+                    seen_images.add(img_p)
                     logger.info(f"Adding Image Path to Context: {img_p}")
                     seen_images.add(img_p)
             elif str(src).lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
@@ -534,9 +547,9 @@ def answer(question, history="", temperature=0.3):
      - If 'Deep Reasoning', explain the 'Why' and 'How'.
      - Cite the source page (e.g. [Page 5]).
      - If an [IMAGE PATH: ...] is provided:
-        - Extract the FILENAME from the path (e.g. "image.jpg" from "https://example.com/image.jpg").
-        - DISPLAY IT using Markdown syntax: ![Image](/images/<filename>)
-        - (Example: ![Image](/images/audi-e-tron.jpg))
+        - Extract the FILENAME from the path (e.g. "image.jpg" from "/api/images/image.jpg").
+        - DISPLAY IT using Markdown syntax: ![Image](/api/images/<filename>)
+        - (Example: ![Image](/api/images/audi-e-tron.jpg))
      - DO NOT SAY "Here is the image". JUST OUTPUT THE MARKDOWN.
     - If you don't know the answer or the context is insufficient, say "ขออภัยครับ ข้อมูลในระบบยังมีไม่เพียงพอ" and ask specific clarifying questions.
     - If the user's intent is unclear, ask for clarification (e.g. "หมายถึงรุ่นไหนครับ?").

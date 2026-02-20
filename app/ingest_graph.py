@@ -397,9 +397,26 @@ def ingest_data():
     total_batches = (len(combined_docs) + 4) // 5
     completed_batches = 0
     
+    def process_url_extractions(url):
+        """Helper to extract model/brand from URL when text is messy."""
+        try:
+            from urllib.parse import urlparse
+            path = urlparse(url).path
+            filename = os.path.basename(path).replace('.html', '').replace('-', ' ')
+            # Simple heuristic for Thai/English car models
+            if any(b in filename.lower() for b in ['xpeng', 'byd', 'tesla', 'audi', 'zeekr', 'deepal']):
+                return filename.title()
+        except: pass
+        return None
+
     def process_batch(batch):
         try: 
-            # logger.info("   Processing graph batch...") 
+            # Pre-filter: Add URL-extracted entities to metadata for LLM hint if needed
+            for doc in batch:
+                model_hint = process_url_extractions(doc.metadata.get('source', ''))
+                if model_hint:
+                    doc.page_content = f"Product: {model_hint}\n{doc.page_content}"
+            
             return llm_transformer.convert_to_graph_documents(batch)
         except Exception as e:
             logger.warning(f"Graph extraction failed for batch: {e}")

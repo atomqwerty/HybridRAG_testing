@@ -7,7 +7,7 @@ import json
 import uuid
 import os
 import glob
-from langchain_neo4j import Neo4jGraph
+from langchain_community.graphs import Neo4jGraph
 from app.crawler import load_web_with_images, get_internal_links, init_driver
 from app.logger import setup_logger
 
