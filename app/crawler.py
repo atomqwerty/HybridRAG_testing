@@ -4,6 +4,7 @@ import uuid
 import time
 import shutil
 import xml.etree.ElementTree as ET
+import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -11,11 +12,25 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 import json
+import io
 from langchain_core.documents import Document
 from app.vision_utils import describe_image, encode_image_from_file
 from app.config import Config
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from PIL import Image
 from urllib.parse import unquote
+
+def get_retry_session(auth_cookies=None):
+    session = requests.Session()
+    if auth_cookies and isinstance(auth_cookies, dict):
+        requests.utils.add_dict_to_cookiejar(session.cookies, auth_cookies)
+        
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
 
 # --- CONFIG LOADER ---
 DEFAULTS = {
@@ -38,9 +53,104 @@ def get_crawler_rules():
     return DEFAULTS
 # ---------------------
 
-# Import ChromeDriverManager only if needed or assume installed
-# from webdriver_manager.chrome import ChromeDriverManager 
-# (We are using system installed chromedriver at /usr/bin/chromedriver)
+# ---------------------------------------------------------------------------
+# Navigation / chrome stripping
+# ---------------------------------------------------------------------------
+
+# HTML tags that are purely structural chrome (no body content)
+_NAV_TAGS = ["header", "footer", "nav", "aside", "menu", "menubar"]
+
+# role= attribute values that indicate navigation widgets
+_NAV_ROLES = {
+    "banner", "navigation", "complementary", "contentinfo",
+    "menubar", "menu", "toolbar", "search",
+}
+
+# CSS class substrings commonly used for navbars / menus
+_NAV_CLASS_KEYWORDS = [
+    "navbar", "nav-bar", "nav-menu", "navmenu",
+    "header", "site-header", "top-bar", "topbar",
+    "menu", "main-menu", "mega-menu", "megamenu",
+    "sidebar", "side-bar", "breadcrumb",
+    "footer", "site-footer", "bottom-bar",
+    "cookie", "consent", "popup", "modal", "overlay",
+    "social-share", "share-bar",
+    "skip-link", "skip-nav",
+]
+
+# aria-label substrings that indicate navigation regions
+_NAV_ARIA_LABELS = [
+    "navigation", "main menu", "site menu", "header", "footer",
+    "breadcrumb", "social", "cookie",
+]
+
+
+# ID substrings that indicate container elements are nav/menu chrome
+# e.g.  id="wb_ResponsiveMenu1",  id="site-header",  id="main-nav"
+_NAV_ID_KEYWORDS = [
+    "nav", "menu", "navbar", "header", "footer",
+    "topbar", "top-bar", "sidebar", "breadcrumb",
+    "cookie", "consent", "overlay", "modal",
+]
+
+
+def _strip_navigation(soup: BeautifulSoup) -> None:
+    """
+    Removes all header/nav/menu/footer chrome from a BeautifulSoup tree in-place.
+    Applies five passes:
+      0. id= attribute keywords  (catches wb_ResponsiveMenu1, site-header, …)
+      1. Tag name (header, nav, aside, footer, menu …)
+      2. role= attribute (role="navigation", role="menu", …)
+      3. CSS class keywords (navbar, topbar, sidebar, …)
+      4. aria-label keywords
+    After all passes, orphaned <input type=checkbox> and <label> toggle
+    widgets (used by mobile menus) are also removed.
+    """
+    # Pass 0 — id attribute keywords
+    # e.g. <div id="wb_ResponsiveMenu1"> or <div id="site-header">
+    for el in soup.find_all(attrs={"id": True}):
+        if el.parent is None:  # already removed by a previous decompose
+            continue
+        el_id = el.get("id", "").lower()
+        if any(kw in el_id for kw in _NAV_ID_KEYWORDS):
+            el.decompose()
+
+    # Pass 1 — tags
+    for tag_name in _NAV_TAGS + ["script", "style", "noscript", "iframe"]:
+        for el in soup.find_all(tag_name):
+            if el.parent is None:
+                continue
+            el.decompose()
+
+    # Pass 2 — role attribute
+    for el in soup.find_all(attrs={"role": True}):
+        if el.parent is None:
+            continue
+        if el.get("role", "").strip().lower() in _NAV_ROLES:
+            el.decompose()
+
+    # Pass 3 — CSS classes
+    for el in soup.find_all(attrs={"class": True}):
+        if el.parent is None:
+            continue
+        classes = " ".join(el.get("class", [])).lower()
+        if any(kw in classes for kw in _NAV_CLASS_KEYWORDS):
+            el.decompose()
+
+    # Pass 4 — aria-label
+    for el in soup.find_all(attrs={"aria-label": True}):
+        if el.parent is None:
+            continue
+        label = el.get("aria-label", "").lower()
+        if any(kw in label for kw in _NAV_ARIA_LABELS):
+            el.decompose()
+
+    # Cleanup — remove <input type="checkbox"> toggle widgets (mobile menus)
+    for el in soup.find_all("input", attrs={"type": "checkbox"}):
+        if el.parent is None:
+            continue
+        el.decompose()
+
 
 def clean_extracted_images():
     """Cleans up old extracted images and logs before fresh ingestion."""
@@ -66,52 +176,56 @@ def clean_extracted_images():
          except Exception as e:
              print(f"   ⚠️ Could not clean log dir: {e}")
 
-def get_internal_links(base_url, max_links=200):
+def get_internal_links(base_url, max_links=200, depth=1, timeout=10, user_agent=None, respect_robots_txt=True, verify_ssl=True, rate_limit_delay=0, auth_cookies=None):
     """
-    Recursively crawls up to 3 levels deep to find car model pages.
-    Uses 'requests' (curl-like) for speed, replacing Selenium.
+    Recursively crawls find internal links up to specified depth.
     """
-    print(f"   🕷️ Deep Crawling (3 Levels) starting at: {base_url} (Using Requests/Curl)")
+    print(f"   🕷️ Deep Crawling ({depth} Levels) starting at: {base_url}")
     
     headers = {
-        "User-Agent": Config.USER_AGENT
+        "User-Agent": user_agent or Config.USER_AGENT
     }
+
+    if respect_robots_txt:
+        try:
+            from urllib.robotparser import RobotFileParser
+            parsed_root = urlparse(base_url)
+            rp = RobotFileParser()
+            rp.set_url(f"{parsed_root.scheme}://{parsed_root.netloc}/robots.txt")
+            rp.read()
+            if not rp.can_fetch(headers["User-Agent"], base_url):
+                print(f"      🚫 robots.txt disallows crawling: {base_url}")
+                return [base_url]
+        except Exception as e:
+            print(f"      ⚠️ robots.txt check failed: {e}")
     
     found_links = set([base_url])
-    queue = [(base_url, 0)] # URL, Depth
+    queue = [(base_url, 0)] # URL, current_depth
     visited = set()
+    session = get_retry_session(auth_cookies)
     
     while queue and len(found_links) < max_links:
-        current_url, depth = queue.pop(0)
+        current_url, curr_depth = queue.pop(0)
         
-        if current_url in visited or depth >= 4:
+        if current_url in visited or curr_depth >= depth + 1:
             continue
         
         visited.add(current_url)
-        print(f"   🕷️  Crawling Sub-Page (Level {depth}): {current_url}")
+        print(f"   🕷️  Crawling Sub-Page (Level {curr_depth}): {current_url}")
         
         try:
-            # Use requests instead of Selenium
-            response = requests.get(current_url, headers=headers, timeout=10)
+            if rate_limit_delay > 0:
+                time.sleep(rate_limit_delay)
+                
+            response = session.get(current_url, headers=headers, timeout=timeout, verify=verify_ssl)
             if response.status_code != 200:
                 print(f"      ⚠️ Failed to fetch (Status {response.status_code}): {current_url}")
                 continue
                 
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # --- SKIP HEADER/FOOTER/NAV to prevent crawling menus ---
-            for tag_name in ["header", "footer", "nav", "aside"]:
-                for tag in soup.find_all(tag_name):
-                    tag.decompose()
-            
-            # Remove by class/id keywords
-            noise_keywords = ["menu", "navigation", "footer", "header", "sidebar", "copyright", "contact"]
-            for tag in soup.find_all(True):
-                if not hasattr(tag, 'attrs') or tag.attrs is None: continue # Safety Check
-                classes = str(tag.get("class", "")) + " " + str(tag.get("id", ""))
-                if any(x in classes.lower() for x in noise_keywords):
-                    tag.decompose()
-            # --------------------------------------------------------
+            # Strip headers, navbars, footers and other chrome
+            _strip_navigation(soup)
             
             domain = urlparse(base_url).netloc
             elements = soup.find_all("a")
@@ -123,63 +237,38 @@ def get_internal_links(base_url, max_links=200):
                     if not href: continue
                     
                     full_url = urljoin(current_url, href)
+                    # Strip fragment
+                    full_url = full_url.split('#')[0]
+                    # Strip trailing slash for consistency
+                    full_url = full_url.rstrip('/')
+                    
                     parsed = urlparse(full_url)
                     
-                    # Normalize domain (ignore www.)
                     base_domain = domain.replace("www.", "")
                     link_domain = parsed.netloc.replace("www.", "")
                     
-                    # DEBUG: Print all candidates
-                    # print(f"      ? Checking: {full_url}")
-
                     if base_domain not in link_domain: 
-                        # print(f"      - Ignored (External): {full_url}")
                         continue
                     
-                    # Filter noise (Minimal - Only strictly useless links)
+                    # Filter noise
                     path = parsed.path.lower()
-                    noise = ['cart', 'login', 'facebook', 'line', 'tel:', 'mailto:', 'javascript', '#', 'review', 'news', 'blog', 'index.html']
+                    noise = ['cart', 'login', 'facebook', 'line', 'tel:', 'mailto:', 'javascript', 'index.html']
                     if any(x in path or x in full_url.lower() for x in noise): 
                         continue
                     
-                    # --- SMART CAR FILTER ---
-                    # The user wants "only car links". We use Brand & Keyword matching.
-                    rules = get_crawler_rules()
-                    if not rules: rules = DEFAULTS # Double safety
-                    brands = rules.get("brands", [])
-                    keywords = rules.get("keywords", [])
-                    
-                    link_text = elem.get_text().lower().strip()
-                    url_lower = full_url.lower()
-                    
-                    is_car_link = False
-                    
-                    # 1. Check URL for brands/models
-                    if any(b in url_lower for b in brands): is_car_link = True
-                    if any(k in url_lower for k in keywords): is_car_link = True
-                    
-                    # 2. Check Anchor Text for brands
-                    if any(b in link_text for b in brands): is_car_link = True
-                    
-                    # In Generic Mode, every link is a "car link" unless excluded
-                    is_car_link = True
-                    
-                    # If it's NOT a car link, skip it (unless we are at root level, where we might need to navigate categories)
-                    # But user asked for "only car link".
-                    if not is_car_link and depth > 0:
-                        # Assuming root page links to categories which link to cars. 
-                        # If we are strictly "only car links", we might miss categories. 
-                        # But typically car links are direct.
-                        continue
-                        
                     if full_url not in found_links:
+                        # Check robots.txt for sub-url if requested
+                        if respect_robots_txt and 'rp' in locals():
+                             if not rp.can_fetch(headers["User-Agent"], full_url):
+                                 print(f"      🚫 robots.txt disallows: {full_url}")
+                                 continue
+
                         found_links.add(full_url)
-                        print(f"      + Queued (Car/Model): {full_url}")
+                        print(f"      + Queued: {full_url}")
+                        if len(found_links) >= max_links: break
                         
-                        queue.append((full_url, depth + 1))
-                    else:
-                         # print(f"      - Ignored (Duplicate): {full_url}")
-                         pass
+                        if curr_depth < depth:
+                            queue.append((full_url, curr_depth + 1))
                             
                 except Exception:
                     continue
@@ -277,266 +366,176 @@ def init_driver():
         print(f"❌ Failed to init driver: {e}")
         return None
 
-def load_web_with_images(url, driver=None):
+def load_web_with_images(url, driver=None, selectors=None, wait_time=2, javascript_enabled=True, timeout=10, user_agent=None, verify_ssl=True, extract_entities=False, auth_cookies=None):
     """
-    Uses Selenium (RPA) to render the page, scroll for lazy loading,
-    and extract high-fidelity text and images.
+    Scrapes a page using Selenium (if JS enabled) or Requests.
+    Supports custom selectors for focused data extraction.
     """
-    print(f"   - Scraping (RPA/Selenium): {url}")
+    print(f"   - Scraping: {url} (JS: {javascript_enabled})")
     
-    should_quit_driver = False
-    if driver is None:
-        print(f"DEBUG: No shared driver provided. Creating new one for {url}")
-        driver = init_driver()
-        should_quit_driver = True
+    html_content = ""
+    soup = None
     
-    if not driver:
-        return [] # Fail if no driver
+    if javascript_enabled:
+        should_quit_driver = False
+        if driver is None:
+            driver = init_driver(user_agent=user_agent)
+            should_quit_driver = True
         
-    try:
-        try:
-            driver.get(url)  
-            # ... (Rest of logic uses 'driver')
-            
-            # --- RPA Action: Scroll to Bottom to trigger Lazy Loading ---
-            print("      ↓ Auto-scrolling to trigger lazy content...")
-            last_height = driver.execute_script("return document.body.scrollHeight")
-            while True:
+        if driver:
+            try:
+                driver.get(url)
+                # If auth cookies exist, add them to selenium and refresh
+                if auth_cookies and isinstance(auth_cookies, dict):
+                    for name, value in auth_cookies.items():
+                        driver.add_cookie({"name": name, "value": value})
+                    driver.get(url) # reload with cookies
+                    
+                # Wait for custom time
+                time.sleep(wait_time)
+                
+                # Optional: Scroll for lazy loading
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2) # Wait for page to load
-                new_height = driver.execute_script("return document.body.scrollHeight")
-                if new_height == last_height:
-                    break
-                last_height = new_height
-            # -------------------------------------------------------------
-            
-            # Get fully rendered HTML
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            
-        finally:
-            if should_quit_driver:
-                driver.quit()
-        
-        # 1. Extract Images (from the rendered Soup)
-        images = soup.find_all('img')
-        image_descriptions = ""
-        
-        # --- SMART SELECTION STRATEGY ---
-        # 1. Collect potential candidates
-        candidates = []
-        for img in images:
-            src = img.get('src') or img.get('data-src')
-            if not src: continue
-            if src.startswith("data:image"): continue
-            
-            full_url = urljoin(url, src)
-            
-            # Filter noise keywords in URL (Removed 'logo' as requested)
-            if any(x in full_url.lower() for x in ['icon', 'button', 'social', 'footer', 'thumb', 'thumbnail']): 
-                continue
+                time.sleep(1)
                 
-            candidates.append(full_url)
-
-        # 2. Download and Filter by Size (Get the "Meatier" content)
-        valid_images = [] # List of (size_in_bytes, local_path, source_url)
-        MAX_CANDIDATES_CHECK = 20 # OPTIMIZATION: Reduced from 100 to 20 for speed
-        
-        print(f"      🔎 Scanning {len(candidates)} images (checking top {MAX_CANDIDATES_CHECK})...")
-        
-        for full_url in list(set(candidates))[:MAX_CANDIDATES_CHECK]:
-            try:
-                img_resp = requests.get(full_url, stream=True, timeout=3)
-                if img_resp.status_code != 200: continue
-                
-                size = len(img_resp.content)
-                # SMART FILTER: Ignore small icons/logos (< 5KB, was 15KB)
-                if size < 5 * 1024: 
-                    print(f"      - Rejected small file size ({size} bytes): {full_url}")
-                    continue
-            
-                # BLACKLIST: Ignore known generic images
-                decoded_url = unquote(full_url.lower())
-                if "home-charging" in decoded_url or "line-add" in decoded_url:
-                    print(f"      - Skipping Blacklisted Image: {full_url}")
-                    continue
-
-                # --- NEW: Check Dimensions (Resolution Filter) ---
-                suffix = Path(full_url).suffix
-                if not suffix or suffix.lower() not in ['.jpg', '.png', '.jpeg', '.webp']:
-                    suffix = '.jpg'
-                    
-                img_filename = f"web_{uuid.uuid4().hex[:8]}{suffix}"
-                save_dir = Path(Config.DATA_DIR) / "extracted_images"
-                save_dir.mkdir(parents=True, exist_ok=True)
-                img_path = save_dir / img_filename
-                
-                with open(img_path, "wb") as f:
-                    f.write(img_resp.content)
-                    
-                # Skip SVGs
-                if img_path.suffix.lower() == '.svg': 
-                    continue
-
-                # --- NEW: Check Dimensions (Resolution Filter) ---
-                try:
-                    with Image.open(img_path) as im:
-                        w, h = im.size
-                        # Reject if too small (thumbnail size like 300x163)
-                        # We want Hero Images > 250x200
-                        # We want Hero Images > 200x150
-                        if w < 200 or h < 150:
-                            # print(f"      - Rejected small image ({w}x{h}): {full_url}")
-                            continue
-                except Exception:
-                    # If PIL cannot open it, it's likely corrupt
-                    continue
-                # -----------------------------------------------
-
-                print(f"      ✅ Accepted Image: {full_url} ({size} bytes, {w}x{h})")
-                valid_images.append((size, img_path, full_url))
-                
+                html_content = driver.page_source
+                soup = BeautifulSoup(html_content, 'html.parser')
             except Exception as e:
-                print(f"      ❌ Image Error {full_url}: {e}")
-                continue
-        
-        # 3. Sort by Size (Descending) -> Largest images differ likely to be Main Content/Diagrams
-        valid_images.sort(key=lambda x: x[0], reverse=True)
-        
-        # 4. Select Images (Top 2 Large Images)
-        top_images = valid_images[:2] # Compromise: fast but gets cover + detail
-        print(f"      🏆 Selected {len(top_images)} valid images >2KB for analysis.")
-
-        # 5. Analyze with Vision
-        for _, img_path, full_url in top_images:
-            try:
-                print(f"      📸 Analyzed Web Image: {os.path.basename(full_url)[:30]}...")
-                b64 = encode_image_from_file(str(img_path))
-                
-                # Save description (DISABLED LOGGING)
-                # log_dir = Path("log")
-                # log_dir.mkdir(parents=True, exist_ok=True)
-                # desc_path = log_dir / (img_path.stem + '_description.txt')
-                
-                # Pass None to save_description_path to avoid file creation
-                desc = describe_image(b64, save_description_path=None)
-                # Store path relative to project root for frontend serving
-                rel_img_path = str(img_path).replace("\\", "/") # Ensure forward slashes
-                image_descriptions += f"\\n[IMAGE PATH: {rel_img_path}]\\n[SOURCE URL: {full_url}]\\n{desc}\\n"
-                
-            except Exception as e:
-                print(f"      ⚠️ Vision analysis failed: {e}")
-                
-        # 2. Extract Text
-        # 2. Extract Text - SMART CLEANING (Reduce Trash Data)
-        
-        # A. Remove Standard Noise Tags
-        # (Re-enabling header/footer removal to fix "trash data" complaint)
-        noise_tags = ["script", "style", "noscript", "header", "footer", "nav", "aside", "form", "iframe", "svg"]
-        for tag in soup(noise_tags):
-            tag.decompose()
-            
-        # Remove breadcrumbs specifically (User Request)
-        for tag in soup.find_all(True, {"class": True}):
-             try:
-                 classes = tag.get("class", [])
-                 if isinstance(classes, str): classes = [classes]
-                 if any("breadcrumb" in c.lower() for c in classes):
-                     tag.decompose()
-             except: pass
-            
-        # B. Remove elements by Class/ID (Menus, Sidebars, Popups, Footers)
-        trash_keywords = ['menu', 'sidebar', 'nav', 'cookie', 'advert', 'popup', 'social', 'share', 'newsletter', 'footer', 'copyright', 'contact', 'facebook']
-        for tag in soup.find_all(True):
-            try:
-                if not hasattr(tag, 'attrs') or tag.attrs is None: continue
-                # Check classes AND IDs
-                classes = str(tag.get("class", "")) + " " + str(tag.get("id", ""))
-                
-                if any(k in classes.lower() for k in trash_keywords):
-                    tag.decompose()
-            except: pass
-            
-        # C. Remove elements by Text Content (Copyright, etc.)
-        text_trash = ["copyright ©", "all rights reserved", "working days/hours"]
-        for tag in soup.find_all(['div', 'span', 'p', 'footer']):
-            try:
-                txt = tag.get_text().lower()
-                if any(x in txt for x in text_trash) and len(txt) < 300: # Safety: Don't delete long articles
-                     # Only delete if it seems like a footer block (short text)
-                     tag.decompose()
-            except: pass
-            
-        # C. Focus on Main Content (if available) - This eliminates 90% of wrapper trash
-        main_content_area = soup.find('main') or soup.find('article') or soup.find('div', id='content') or soup.find('div', class_='content')
-        
-        # If we found a specific main area, use it. Otherwise use the cleaned soup.
-        content_source = main_content_area if main_content_area else soup
-            
-        text = content_source.get_text(separator='\\n')
-        
-        # Clean up whitespace
-        lines = (line.strip() for line in text.splitlines())
-        clean_text = '\\n'.join(line for line in lines if line)
-        
-        # Combine
-        full_content = f"Source URL: {url}\\n\\n{clean_text}\\n\\n### DETECTED IMAGES FROM WEBPAGE:\\n{image_descriptions}"
-        
-        # FINAL CLEAN: Remove Markdown Bolding (User Request)
-        full_content = full_content.replace("**", "").replace("__", "")
-        
-        # --- Log Scraped Content (DISABLED) ---
-        # try:
-        #     log_dir = Path("log")
-        #     log_dir.mkdir(parents=True, exist_ok=True)
-        #     # Create simple filename
-        #     sanitized_name = url.replace("https://", "").replace("http://", "").replace("/", "_").replace(":", "")[:50]
-        #     log_file = log_dir / f"web_scraped_{sanitized_name}_{uuid.uuid4().hex[:6]}.txt"
-        #     
-        #     with open(log_file, "w", encoding="utf-8") as f:
-        #         f.write(full_content)
-        #     print(f"      📝 Scraped content saved to: {log_file}")
-        # except Exception as e:
-        #     print(f"      ⚠️ Failed to save web log: {e}")
-        # ---------------------------
-        
-        print(f"   ✅ CRAWLED: {url}")
-        
-        # 3. Determine Best Image (Cover) for the UI
-        best_image_path = "default.jpg"
-        if top_images:
-             # top_images is list of (_, path, url)
-             # Get filename: web_xxxx.jpg
-             best_image_path = top_images[0][1].name
-             print(f"      🖼️ Selected Best Cover Image: {best_image_path}")
-
-        return [Document(
-            page_content=full_content,
-            metadata={
-                "source": url, 
-                "title": soup.title.string if soup.title else url,
-                "image_path": best_image_path # <-- NEW: Pass to DLT sink
-            }
-        )]
-        
-    except Exception as e:
-        print(f"      ❌ Web Scraping (Selenium) failed for {url}: {e}")
-        # Fallback to Requests (Static Scraping)
+                print(f"      ❌ Selenium failed for {url}: {e}")
+            finally:
+                if should_quit_driver:
+                    driver.quit()
+    
+    if not soup: # Fallback or JS disabled
         try:
-            print("      ⚠️ Attempting Fallback to Requests (Static HTML)...")
-            response = requests.get(url, headers={'User-Agent': Config.USER_AGENT}, timeout=10)
+            print(f"      ⚠️ Using Requests for {url}")
+            headers = {"User-Agent": user_agent or Config.USER_AGENT}
+            session = get_retry_session(auth_cookies)
+            response = session.get(url, headers=headers, timeout=timeout, verify=verify_ssl)
             if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                text = soup.get_text(separator='\\n')
-                # Clean up whitespace
-                lines = (line.strip() for line in text.splitlines())
-                clean_text = '\\n'.join(line for line in lines if line)
-                
-                full_content = f"Source URL: {url}\\n(Fallback Scraping)\\n\\n{clean_text}"
-                return [Document(
-                    page_content=full_content,
-                    metadata={"source": url, "title": soup.title.string if soup.title else url}
-                )]
-        except Exception as e2:
-             print(f"      ❌ Fallback failed too: {e2}")
-        
+                html_content = response.text
+                soup = BeautifulSoup(html_content, 'html.parser')
+        except Exception as e:
+            print(f"      ❌ Scrape failed for {url}: {e}")
+            return []
+
+    if not soup:
         return []
+
+    # 1. Custom Selectors Logic
+    main_content_area = None
+    if selectors:
+        for selector in selectors:
+            try:
+                found = soup.select_one(selector)
+                if found:
+                    main_content_area = found
+                    print(f"      🎯 Found content via selector: {selector}")
+                    break
+            except Exception as e:
+                print(f"      ⚠️ Invalid selector {selector}: {e}")
+
+    # 2. Extract Images
+    images = soup.find_all('img')
+    image_descriptions = ""
+    candidates = []
+    for img in images:
+        src = img.get('src') or img.get('data-src')
+        if not src: continue
+        if src.startswith("data:image"): continue
+        full_url = urljoin(url, src)
+        if any(x in full_url.lower() for x in ['icon', 'button', 'social', 'footer', 'thumb']): continue
+        candidates.append(full_url)
+
+    valid_images = []
+    for full_url in list(set(candidates))[:10]:
+        try:
+            img_resp = requests.get(full_url, stream=True, timeout=5, verify=verify_ssl)
+            if img_resp.status_code == 200:
+                content = img_resp.content
+                size = len(content)
+                if size > 5 * 1024:
+                    ctype = (img_resp.headers.get('Content-Type') or '').lower()
+                    to_write = None
+                    ext = 'jpg'
+
+                    # Detect SVG/vector graphics and attempt conversion to PNG if cairosvg is available.
+                    is_svg = False
+                    if 'svg' in ctype or content.lstrip().startswith(b'<?xml') or b'<svg' in content[:200].lower():
+                        is_svg = True
+
+                    if is_svg:
+                        try:
+                            import cairosvg
+                            png_bytes = cairosvg.svg2png(bytestring=content)
+                            # validate result
+                            Image.open(io.BytesIO(png_bytes)).verify()
+                            to_write = png_bytes
+                            ext = 'png'
+                        except Exception as e:
+                            print(f"      ⚠️ Skipping SVG or unsupported vector at {full_url}: {e}")
+                            continue
+                    else:
+                        # Validate raster image bytes with PIL
+                        try:
+                            Image.open(io.BytesIO(content)).verify()
+                            to_write = content
+                            ext = 'jpg'
+                        except Exception:
+                            print(f"      ⚠️ Skipping non-image or corrupted file at {full_url} (Content-Type: {ctype})")
+                            continue
+
+                    img_filename = f"web_{uuid.uuid4().hex[:8]}.{ext}"
+                    img_path = Path(Config.DATA_DIR) / "extracted_images" / img_filename
+                    img_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(img_path, "wb") as f:
+                        f.write(to_write)
+                    valid_images.append((len(to_write), img_path, full_url))
+        except Exception as e:
+            print(f"      ⚠️ Failed to fetch or validate image {full_url}: {e}")
+            continue
+
+    valid_images.sort(key=lambda x: x[0], reverse=True)
+    top_images = valid_images[:2]
+
+    for _, img_path, full_url in top_images:
+        try:
+            b64 = encode_image_from_file(str(img_path))
+            if not b64:
+                print(f"      ⚠️ Skipping image {img_path} because it could not be encoded/compressed")
+                continue
+            desc = describe_image(b64, save_description_path=None)
+            file_name = img_path.name
+            rel_img_path = f"/api/images/{file_name}"
+            image_descriptions += f"\n[IMAGE PATH: {rel_img_path}]\n[SOURCE URL: {full_url}]\n{desc}\n"
+        except Exception as e:
+            print(f"      ⚠️ Error processing image {img_path}: {e}")
+            continue
+
+    # 3. Clean and Extract Text
+    content_source = main_content_area if main_content_area else soup
+    # Strip all navigation/chrome from the chosen content area
+    _strip_navigation(content_source)
+        
+    text = content_source.get_text(separator='\\n')
+    lines = (line.strip() for line in text.splitlines())
+    clean_text = '\\n'.join(line for line in lines if line)
+    
+    full_content = f"Source URL: {url}\\n\\n{clean_text}\\n\\n### IMAGES:\\n{image_descriptions}"
+    
+    meta = {
+        "source": url, 
+        "title": soup.title.string if soup.title else url,
+        "image_path": top_images[0][1].name if top_images else "default.jpg"
+    }
+    
+    if extract_entities:
+        emails = list(set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', clean_text)))
+        phones = list(set(re.findall(r'\+?\d{1,4}?[-.\s]?\(?\d{1,3}?\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}', clean_text)))
+        meta["extracted_emails"] = emails
+        meta["extracted_phones"] = [p for p in phones if len(p) >= 10]
+        
+    return [Document(
+        page_content=full_content,
+        metadata=meta
+    )]

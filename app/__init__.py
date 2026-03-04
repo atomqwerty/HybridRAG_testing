@@ -3,7 +3,9 @@ from flask_cors import CORS
 from app.config import Config
 from app.api.chat_routes import api as chat_bp
 from app.api.file_routes import api as file_bp
-from app.services.chat_service import ChatService
+from app.api.crawl_routes import api as crawl_bp
+from app.api.agent_routes import api as agent_bp
+from app.api.auth_routes import api as auth_bp
 import logging
 import os
 
@@ -17,8 +19,16 @@ def create_app():
     CORS(app)
 
     # Register Blueprints
+    app.secret_key = Config.SECRET_KEY
+    app.register_blueprint(auth_bp, url_prefix='/api')
     app.register_blueprint(chat_bp, url_prefix='/api')
     app.register_blueprint(file_bp, url_prefix='/api')
+    app.register_blueprint(crawl_bp, url_prefix='/api')
+    app.register_blueprint(agent_bp, url_prefix='/api')
+
+    # Seed default admin on startup
+    from app.services.user_service import UserService
+    UserService._ensure_seed()
 
     # Register Static/Frontend Routes (Legacy support)
     @app.route('/', defaults={'path': ''})

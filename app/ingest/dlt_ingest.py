@@ -26,7 +26,6 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
 
 
 def apply_safety_split(chunks, limit=2000):
@@ -93,7 +92,7 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
         # ColPali/ColQwen usually has 128 dim (per token). 
         # If we use pooled, we need to know. For now assuming 128 based on Config.
         create_vector_index(graph, dimensions=Config.EMBEDDING_DIMENSION)
-        create_text_vector_index(graph, dimensions=3072)
+        create_text_vector_index(graph, dimensions=Config.EMBEDDING_DIMENSION)
         
         def get_visual_embedding(image_bytes):
             """Returns placeholder visual embedding."""
@@ -104,8 +103,8 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
         # Initialize Text Embedding (for MinerU chunks)
         text_embeddings = OpenAIEmbeddings(
             model=Config.OPENAI_EMBEDDING_MODEL,
-            api_key=Config.OPENAI_API_KEY,
-            base_url=Config.OPENAI_BASE_URL
+            api_key=Config.OPENAI_EMBEDDING_API_KEY,
+            base_url=Config.OPENAI_EMBEDDING_BASE_URL
         )
 
         # Initialize LLM for Graph Extraction (Moved up for MinerU access)
@@ -133,9 +132,7 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
 
             logger.info(f"   🧠 MinerU: Chunking & Embedding content for {source_id}...")
             
-            # Chunking
             # Chunking (Semantic)
-            # splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             splitter = SemanticChunker(embeddings=text_embeddings)
             chunks = splitter.create_documents([content])
             chunks = apply_safety_split(chunks, limit=2000)
@@ -151,7 +148,7 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                     vector = text_embeddings.embed_query(chunk_text)
                 except Exception as e:
                     logger.warning(f"Embedding failed for chunk {i}: {e}")
-                    vector = [0.0] * 3072 # Fallback size, check model
+                    vector = [0.0] * Config.EMBEDDING_DIMENSION # Fallback size, check model
 
                 # Write to Neo4j
                 query = """
@@ -319,7 +316,6 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                 if "content" in item:
                     try:
                         logger.info(f"   🧠 Vectorizing Content for {identifier}...")
-                        # splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
                         splitter = SemanticChunker(embeddings=text_embeddings)
                         chunks = splitter.create_documents([item['content']])
                         chunks = apply_safety_split(chunks, limit=2000)
@@ -331,7 +327,7 @@ def load_to_neo4j(items: Iterator[Dict[str, Any]]):
                             try:
                                 vector = text_embeddings.embed_query(chunk_text)
                             except:
-                                vector = [0.0] * 3072
+                                vector = [0.0] * Config.EMBEDDING_DIMENSION
 
                             # Write Web Chunk
                             chunk_query = """
@@ -408,8 +404,6 @@ def hybrid_rag_source(urls: list, files: list, existing_ids: set = None):
             
             print(f"DEBUG: Found {len(all_urls)} pages to scrape for {url}")
             
-            print(f"DEBUG: Found {len(all_urls)} pages to scrape for {url}")
-            
             # Incremental Check per Page
             if existing_ids:
                 new_urls = [u for u in all_urls if u not in existing_ids]
@@ -464,6 +458,7 @@ class DLTIngestor(BaseIngestor):
     def ingest_document(self, file_path: str, source_type: str = "file") -> Dict[str, Any]:
         """Ingests a single document using DLT Pipeline."""
         logger.info(f"🚀 Starting DLT Ingestion for {file_path}...")
+        update_status(f"Starting ingestion for {os.path.basename(file_path)}...", 10)
         
         try:
             # 1. Setup Pipeline
@@ -486,10 +481,12 @@ class DLTIngestor(BaseIngestor):
                 loader_file_format="jsonl"
             )
             logger.info(f"DLT Load Info: {load_info}")
+            update_status("Extracting PDF content (MinerU / Vision)...", 30)
             
             # 3. Sync to Neo4j
             all_items = list(hybrid_rag_source(target_urls, target_files, set()))
             load_to_neo4j(all_items)
+            update_status("Building Knowledge Graph and Vector Chunks...", 70)
             
             # 4. Enrich
             graph = Neo4jGraph(url=Config.NEO4J_URI, username=Config.NEO4J_USERNAME, password=Config.NEO4J_PASSWORD)
@@ -499,17 +496,20 @@ class DLTIngestor(BaseIngestor):
             # 5. Metadata/Trust
             filename = os.path.basename(file_path)
             auto_add_trust_rule(filename, score=1.0, rule_type='file')
+            update_status("Ingestion Complete. Refreshing UI.", 100)
             
             logger.info(f"✅ Successfully ingested {filename}")
             return {"status": "success", "message": f"Ingested {filename}"}
             
         except Exception as e:
             logger.error(f"DLT Ingestion Failed: {e}")
+            update_status(f"Ingestion failed: {e}", 0, "failed")
             raise e
 
     def ingest_url(self, url: str) -> Dict[str, Any]:
         """Ingests a URL recursively using the existing deep crawler logic."""
         logger.info(f"🚀 Starting DLT Ingestion for URL {url}...")
+        update_status(f"Crawling URL {url}...", 10)
         
         try:
             output_dir = os.path.join(Config.DATA_DIR, "dlt_output")
@@ -530,10 +530,12 @@ class DLTIngestor(BaseIngestor):
                 loader_file_format="jsonl"
             )
             logger.info(f"DLT URL Load Info: {load_info}")
+            update_status("Rendering Webpages and embedding text...", 40)
             
             # Sync to Neo4j
             all_items = list(hybrid_rag_source(target_urls, target_files, set()))
             load_to_neo4j(all_items)
+            update_status("Extracting entities into Knowledge Graph...", 75)
             
             # Enrich
             graph = Neo4jGraph(url=Config.NEO4J_URI, username=Config.NEO4J_USERNAME, password=Config.NEO4J_PASSWORD)
@@ -548,9 +550,11 @@ class DLTIngestor(BaseIngestor):
                     auto_add_trust_rule(domain, score=1.0, rule_type='domain')
             except: pass
             
+            update_status("Web Crawl Complete. Refreshing UI.", 100)
             logger.info(f"✅ Successfully crawled {url}")
             return {"status": "success", "message": f"Crawled & Ingested {url}"}
             
         except Exception as e:
             logger.error(f"DLT URL Ingestion Failed: {e}")
+            update_status(f"URL Crawl failed: {e}", 0, "failed")
             raise e

@@ -1,197 +1,168 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import './App.css';
 
+const ROLE_BADGE = { superadmin: '🔑 Super Admin', admin: '⚙️ Admin', user: '👤 User' };
+
 function App() {
-    const [messages, setMessages] = useState([]);
+    // ---- Auth State ----
+    const [token, setToken] = useState(() => localStorage.getItem('rag_token'));
+    const [currentUser, setCurrentUser] = useState(null);
+    const [authError, setAuthError] = useState('');
+    // ---- App State ----
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
     const [sessionId] = useState(() => Math.random().toString(36).substr(2, 9));
     const [lightboxImage, setLightboxImage] = useState(null);
-    const [isCreative, setIsCreative] = useState(true); // Default to Creative (0.3)
+    const [isCreative, setIsCreative] = useState(true);
 
     // View State ('chat' or 'settings')
-    const [view, setView] = useState('chat');
+    const [activeView, setActiveView] = useState('chat');
+
+    // Config & Files
     const [config, setConfig] = useState({ strict_mode: true, rules: [], default_score: 0.5 });
     const [availableFiles, setAvailableFiles] = useState([]);
+    const [selectedSources, setSelectedSources] = useState(new Set());
+
+    // New Rule State
+    const [newRulePattern, setNewRulePattern] = useState('');
+    const [newRuleScore, setNewRuleScore] = useState(1.0);
 
     const [currUrl, setCurrUrl] = useState('');
     const [uploading, setUploading] = useState(false);
     const [isIngesting, setIsIngesting] = useState(false);
     const [ingestStatus, setIngestStatus] = useState({ percent: 0, message: '' });
 
-    // --- Status & Notification State ---
-    const [uploadStatus, setUploadStatus] = useState(null); // { type: 'success'|'error', msg: '' }
-
-    // Helper: Clear status after 3 seconds
-    const showStatus = (type, msg) => {
-        setUploadStatus({ type, msg });
-        setTimeout(() => setUploadStatus(null), 5000);
-    };
-
-    // --- Drag and Drop Logic ---
+    const [uploadStatus, setUploadStatus] = useState(null);
     const [isDragging, setIsDragging] = useState(false);
 
-    const handleDrag = (e) => {
+    const [messages, setMessages] = useState([]);
+    const messagesEndRef = useRef(null);
+
+    // Derived
+    const isAdmin = currentUser?.role === 'admin' || currentUser?.role === 'superadmin';
+    const isSuperAdmin = currentUser?.role === 'superadmin';
+
+    // ---- Auth helpers ----
+    const authFetch = useCallback((url, options = {}) => {
+        const headers = { ...(options.headers || {}), 'Authorization': `Bearer ${token}` };
+        return fetch(url, { ...options, headers });
+    }, [token]);
+
+    // On mount / token change: verify token and get current user
+    useEffect(() => {
+        if (!token) { setCurrentUser(null); return; }
+        fetch('/api/auth/me', { headers: { 'Authorization': `Bearer ${token}` } })
+            .then(r => r.ok ? r.json() : Promise.reject())
+            .then(setCurrentUser)
+            .catch(() => { localStorage.removeItem('rag_token'); setToken(null); setCurrentUser(null); });
+    }, [token]);
+
+    const handleLogin = async (e) => {
         e.preventDefault();
-        e.stopPropagation();
-        if (e.type === 'dragenter' || e.type === 'dragover') {
-            setIsDragging(true);
-        } else if (e.type === 'dragleave') {
-            setIsDragging(false);
+        const form = e.target;
+        const username = form.username.value.trim();
+        const password = form.password.value;
+        setAuthError('');
+        try {
+            const res = await fetch('/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password }),
+            });
+            const data = await res.json();
+            if (!res.ok) { setAuthError(data.error || 'Login failed'); return; }
+            localStorage.setItem('rag_token', data.token);
+            setToken(data.token);
+            setCurrentUser(data.user);
+        } catch (e) {
+            setAuthError('Cannot connect to server');
         }
     };
 
-    const traverseFileTree = (item, path = "") => {
-        return new Promise((resolve) => {
-            if (item.isFile) {
-                item.file((file) => {
-                    resolve([file]);
-                });
-            } else if (item.isDirectory) {
-                const dirReader = item.createReader();
-                dirReader.readEntries(async (entries) => {
-                    let files = [];
-                    for (let i = 0; i < entries.length; i++) {
-                        const subFiles = await traverseFileTree(entries[i], path + item.name + "/");
-                        files = files.concat(subFiles);
-                    }
-                    resolve(files);
-                });
-            } else {
-                resolve([]);
-            }
-        });
+    const handleLogout = () => {
+        localStorage.removeItem('rag_token');
+        setToken(null);
+        setCurrentUser(null);
+        setMessages([]);
     };
 
-    // Helper to refresh data without changing view
-    const refreshSettingsData = async () => {
+    // Login screen rendered via main return (not early return, to satisfy hooks rules)
+    const LoginScreen = () => (
+        <div style={{
+            minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: 'linear-gradient(135deg, #0f0c29, #302b63, #24243e)'
+        }}>
+            <div style={{
+                background: 'rgba(255,255,255,0.05)', backdropFilter: 'blur(16px)', borderRadius: '20px',
+                border: '1px solid rgba(255,255,255,0.12)', padding: '48px', width: '380px',
+                boxShadow: '0 24px 64px rgba(0,0,0,0.5)'
+            }}>
+                <div style={{ textAlign: 'center', marginBottom: '32px' }}>
+                    <div style={{ fontSize: '3rem', marginBottom: '12px' }}>🌌</div>
+                    <h1 style={{ margin: 0, fontSize: '1.6rem', color: '#fff', fontWeight: 700 }}>Hybrid RAG</h1>
+                    <p style={{ color: '#9ca3af', fontSize: '0.9rem', marginTop: '8px' }}>Sign in to continue</p>
+                </div>
+                <form onSubmit={handleLogin}>
+                    <div style={{ marginBottom: '16px' }}>
+                        <label style={{ display: 'block', color: '#d1d5db', fontSize: '0.85rem', marginBottom: '6px' }}>Username</label>
+                        <input id="login-username" name="username" type="text" required autoFocus
+                            style={{
+                                width: '100%', padding: '10px 14px', borderRadius: '10px',
+                                border: '1px solid rgba(255,255,255,0.15)', background: 'rgba(255,255,255,0.08)',
+                                color: '#fff', fontSize: '0.95rem', boxSizing: 'border-box', outline: 'none'
+                            }}
+                        />
+                    </div>
+                    <div style={{ marginBottom: '24px' }}>
+                        <label style={{ display: 'block', color: '#d1d5db', fontSize: '0.85rem', marginBottom: '6px' }}>Password</label>
+                        <input id="login-password" name="password" type="password" required
+                            style={{
+                                width: '100%', padding: '10px 14px', borderRadius: '10px',
+                                border: '1px solid rgba(255,255,255,0.15)', background: 'rgba(255,255,255,0.08)',
+                                color: '#fff', fontSize: '0.95rem', boxSizing: 'border-box', outline: 'none'
+                            }}
+                        />
+                    </div>
+                    {authError && <p style={{ color: '#f87171', fontSize: '0.85rem', marginBottom: '16px', textAlign: 'center' }}>{authError}</p>}
+                    <button id="login-submit" type="submit"
+                        style={{
+                            width: '100%', padding: '12px', borderRadius: '10px', border: 'none',
+                            background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+                            color: '#fff', fontWeight: 700, fontSize: '1rem', cursor: 'pointer'
+                        }}
+                    >Sign In</button>
+                </form>
+            </div>
+        </div>
+    );
+
+    // --- Core Logic ---
+
+    const refreshData = async () => {
         try {
             const [configRes, filesRes] = await Promise.all([
-                fetch('/api/config/trust?_t=' + Date.now()),
-                fetch('/api/files?_t=' + Date.now())
+                authFetch('/api/config/trust?_t=' + Date.now()),
+                authFetch('/api/files?_t=' + Date.now())
             ]);
             const configData = await configRes.json();
             const filesData = await filesRes.json();
             setConfig(configData);
             setAvailableFiles(filesData.files || []);
         } catch (err) {
-            console.error("Failed to refresh settings data", err);
+            console.error("Failed to refresh data", err);
         }
     };
 
-    const handleDrop = async (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        setIsDragging(false);
-
-        const items = e.dataTransfer.items;
-        if (!items || items.length === 0) return;
-
-        setUploading(true);
-        const formData = new FormData();
-        let fileCount = 0;
-
-        try {
-            const filePromises = [];
-            for (let i = 0; i < items.length; i++) {
-                const item = items[i].webkitGetAsEntry();
-                if (item) {
-                    filePromises.push(traverseFileTree(item));
-                }
-            }
-
-            const results = await Promise.all(filePromises);
-            const flatFiles = results.flat();
-
-            if (flatFiles.length === 0) {
-                showStatus('error', "No valid files found in drop.");
-                setUploading(false);
-                return;
-            }
-
-            for (const file of flatFiles) {
-                formData.append('file', file);
-                fileCount++;
-            }
-
-            // Reuse the existing fetch logic
-            const res = await fetch('/api/ingest/upload', {
-                method: 'POST',
-                body: formData
-            });
+    useEffect(() => {
+        if (!currentUser) return;
+        refreshData();
+        const initSources = async () => {
+            const res = await authFetch('/api/files');
             const data = await res.json();
-            if (res.ok) {
-                showStatus('success', `Success: Processed ${fileCount} files.`);
-                await refreshSettingsData(); // Refresh immediately
-                setIsIngesting(true);
-            } else {
-                showStatus('error', 'Error: ' + data.error);
-            }
-        } catch (error) {
-            console.error(error);
-            showStatus('error', "Drag and drop failed");
-        } finally {
-            setUploading(false);
-        }
-    };
-
-    const messagesEndRef = useRef(null);
-    const viewRef = useRef(view);
-
-    useEffect(() => { viewRef.current = view; }, [view]);
-
-    // Fetch Config on open settings
-    const openSettings = async () => {
-        await refreshSettingsData();
-        setView('settings');
-    };
-
-    const saveSettings = async () => {
-        try {
-            await fetch('/api/config/trust', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(config)
-            });
-            setView('chat');
-            alert("Settings Saved!");
-        } catch (err) {
-            alert("Failed to save settings: " + err);
-        }
-    };
-
-    const removeRule = async (idx) => {
-        const ruleToRemove = config.rules[idx];
-        if (!window.confirm(`⚠️ DANGER: This will PERMANENTLY DELETE all data from "${ruleToRemove.pattern}" from the database.\n\nAre you sure you want to proceed?`)) {
-            return;
-        }
-
-        try {
-            const newRules = config.rules.filter((_, i) => i !== idx);
-            setConfig({ ...config, rules: newRules });
-
-            const res = await fetch('/api/source', {
-                method: 'DELETE',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ pattern: ruleToRemove.pattern })
-            });
-            const data = await res.json();
-            if (data.status === 'success') {
-                alert("✅ Data purged successfully: " + data.message);
-            } else {
-                alert("⚠️ Error purging data: " + (data.error || "Unknown"));
-            }
-        } catch (err) {
-            alert("❌ Network Error during purge: " + err);
-        }
-    };
-
-    const updateRuleScore = (idx, val) => {
-        const newScore = parseFloat(val);
-        const newRules = [...config.rules];
-        newRules[idx].score = isNaN(newScore) ? 0 : newScore;
-        setConfig({ ...config, rules: newRules });
-    };
+            if (data.files) setSelectedSources(new Set(data.files));
+        };
+        initSources();
+    }, [currentUser]);
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -201,54 +172,19 @@ function App() {
         scrollToBottom();
     }, [messages]);
 
-    // Check status on load (in case user refreshed during ingestion)
-    useEffect(() => {
-        const checkStatus = async () => {
-            try {
-                const res = await fetch('/api/ingest/status');
-                const data = await res.json();
-                if (data.status === 'running') {
-                    setIsIngesting(true);
-                    setIngestStatus(data);
-                }
-            } catch (e) { }
-        };
-        checkStatus();
-    }, []);
-
+    // Polling for ingestion
     useEffect(() => {
         let interval;
         if (isIngesting) {
             interval = setInterval(async () => {
                 try {
-                    const res = await fetch('/api/ingest/status');
+                    const res = await authFetch('/api/ingest/status');
                     const data = await res.json();
                     setIngestStatus(data);
-
                     if (data.percent >= 100) {
                         setIsIngesting(false);
-                        setUploading(false); // Ensure button enables
-                        // FIX: Refresh Settings (Trust Rules) automatically when done
-                        const refreshData = async () => {
-                            try {
-                                const [configRes, filesRes] = await Promise.all([
-                                    fetch('/api/config/trust?_t=' + Date.now()),
-                                    fetch('/api/files?_t=' + Date.now())
-                                ]);
-                                const configData = await configRes.json();
-                                const filesData = await filesRes.json();
-                                setConfig(configData);
-                                setAvailableFiles(filesData.files || []);
-                            } catch (err) { console.error(err); }
-                        };
-
-                        // Refresh data if in settings view
-                        if (viewRef.current === 'settings') {
-                            refreshData();
-                        }
-
-                        // Optional: Alert or toast notification? 
-                        // For now silent completion is preferred by user.
+                        setUploading(false);
+                        refreshData();
                     }
                 } catch (e) { }
             }, 1000);
@@ -256,163 +192,32 @@ function App() {
         return () => clearInterval(interval);
     }, [isIngesting]);
 
-    // Helper to parse bold (**text**) AND images (![alt](src))
-    const processInlineMarkdown = (text) => {
-        // Regex to split by bold OR image
-        // Group 1: **bold**
-        // Group 2: ![alt](src)
-        const parts = text.split(/(\*\*.*?\*\*)|(!\[.*?\]\(.*?\))/g);
+    // --- Handlers ---
 
-        return parts.map((part, index) => {
-            if (!part) return null;
-
-            // Bold
-            if (part.startsWith('**') && part.endsWith('**')) {
-                return <strong key={index}>{part.slice(2, -2)}</strong>;
-            }
-
-            // Image
-            if (part.match(/^!\[(.*?)\]\((.*?)\)$/)) {
-                const match = part.match(/^!\[(.*?)\]\((.*?)\)$/);
-                const alt = match[1];
-                const src = match[2];
-                return (
-                    <img
-                        key={index}
-                        src={src}
-                        alt={alt}
-                        onClick={() => openLightbox(src)}
-                        style={{
-                            maxWidth: '100%',
-                            borderRadius: '8px',
-                            cursor: 'pointer',
-                            margin: '5px 0',
-                            display: 'block'
-                        }}
-                    />
-                );
-            }
-
-            return part;
-        });
-    };
-
-    // Format message content to preserve tables, headers, and bold
-    const formatMessage = (content) => {
-        // Split by code blocks and tables
-        const lines = content.split('\n');
-        const formatted = [];
-        let inTable = false;
-        let tableRows = [];
-
-        lines.forEach((line, idx) => {
-            // Detect markdown table
-            if (line.trim().startsWith('|')) {
-                inTable = true;
-                tableRows.push(line);
-            } else {
-                if (inTable && tableRows.length > 0) {
-                    // End of table, render it
-                    formatted.push(
-                        <div key={`table-${idx}`} className="markdown-table">
-                            {renderTable(tableRows)}
-                        </div>
-                    );
-                    tableRows = [];
-                    inTable = false;
-                }
-                if (line.trim()) {
-                    // Check for Headers (###)
-                    if (line.startsWith('###')) {
-                        const headerText = line.replace(/^###\s*/, '');
-                        formatted.push(<h3 key={idx}>{processInlineMarkdown(headerText)}</h3>);
-                    }
-                    // Check for Bullet Points
-                    else if (line.trim().startsWith('-')) {
-                        const liText = line.trim().substring(1).trim();
-                        formatted.push(<li key={idx}>{processInlineMarkdown(liText)}</li>);
-                    }
-                    // Normal text + Inline Images
-                    else {
-                        formatted.push(<div key={idx}>{processInlineMarkdown(line)}</div>);
-                    }
-                }
-            }
-        });
-
-        // Handle remaining table
-        if (tableRows.length > 0) {
-            formatted.push(
-                <div key="table-final" className="markdown-table">
-                    {renderTable(tableRows)}
-                </div>
-            );
-        }
-
-        return formatted.length > 0 ? formatted : content;
-    };
-
-    const renderTable = (rows) => {
-        const tableData = rows.map(row =>
-            row.split('|').filter(cell => cell.trim()).map(cell => cell.trim())
-        );
-
-        if (tableData.length < 2) return rows.join('\n');
-
-        const headers = tableData[0];
-        const dataRows = tableData.slice(2); // Skip header separator
-
-        return (
-            <table>
-                <thead>
-                    <tr>
-                        {headers.map((header, i) => <th key={i}>{processInlineMarkdown(header)}</th>)}
-                    </tr>
-                </thead>
-                <tbody>
-                    {dataRows.map((row, i) => (
-                        <tr key={i}>
-                            {row.map((cell, j) => <td key={j}>{processInlineMarkdown(cell)}</td>)}
-                        </tr>
-                    ))}
-                </tbody>
-            </table>
-        );
-    };
-
-    const sendMessage = async (e) => {
+    const handleSendMessage = async (e) => {
         e.preventDefault();
-        if (!input.trim()) return;
+        if (!input.trim() || loading) return;
 
         const userMessage = input.trim();
         setInput('');
-
-        // 1. Add User Message
         setMessages(prev => [...prev, { type: 'user', content: userMessage }]);
-
-        // 2. Add Bot Placeholder (Empty content initially)
         setMessages(prev => [...prev, { type: 'bot', content: '', sources: [], images: [] }]);
         setLoading(true);
 
         try {
-            // Use STREAMING endpoint
-            const response = await fetch('/api/chat/stream', {
+            const response = await authFetch('/api/chat/stream', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     message: userMessage,
                     session_id: sessionId,
                     temperature: isCreative ? 0.3 : 0.0,
-                    history: messages.map(m => `${m.type === 'user' ? 'User' : 'Bot'}: ${m.content}`).join('\n')
+                    selected_sources: Array.from(selectedSources)
                 })
             });
 
-            if (!response.ok) {
-                const data = await response.json();
-                throw new Error(data.error || 'Failed to fetch');
-            }
+            if (!response.ok) throw new Error(`Server error ${response.status}`);
 
-            // 3. Read Stream
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let accumulatedContent = "";
@@ -428,39 +233,36 @@ function App() {
                     if (!line.trim()) continue;
                     try {
                         const data = JSON.parse(line);
-
                         setMessages(prev => {
                             const newMsgs = [...prev];
-                            const lastMsgIndex = newMsgs.length - 1;
-                            const lastMsg = { ...newMsgs[lastMsgIndex] }; // Copy object
-
-                            if (data.type === 'meta') {
-                                // Received Sources/Images
-                                lastMsg.sources = data.sources || [];
-                                lastMsg.images = data.images || [];
+                            const last = { ...newMsgs[newMsgs.length - 1] };
+                            if (data.type === 'thought') {
+                                last.thought = data.content;
+                            } else if (data.type === 'meta') {
+                                last.sources = data.sources || [];
+                                last.images = data.images || [];
+                                last.agent = data.agent || 'text';
+                                // Clear thought once content or meta arrives, 
+                                // or keep it as a status? Let's keep it until 'token' arrives.
                             } else if (data.type === 'token') {
-                                // Received Text Token
+                                last.thought = null; // Clear thought once we start getting answer tokens
                                 accumulatedContent += data.content;
-                                lastMsg.content = accumulatedContent;
+                                last.content = accumulatedContent;
+                            } else if (data.type === 'error') {
+                                last.type = 'error';
+                                last.content = data.content;
+                                last.thought = null;
                             }
-
-                            newMsgs[lastMsgIndex] = lastMsg;
+                            newMsgs[newMsgs.length - 1] = last;
                             return newMsgs;
                         });
-                    } catch (e) {
-                        // console.error("Stream parse error:", e); 
-                    }
+                    } catch (e) { }
                 }
             }
-
         } catch (error) {
-            console.error(error);
             setMessages(prev => {
                 const newMsgs = [...prev];
-                newMsgs[newMsgs.length - 1] = {
-                    type: 'error',
-                    content: `Connection error: ${error.message}`
-                };
+                newMsgs[newMsgs.length - 1] = { type: 'error', content: error.message };
                 return newMsgs;
             });
         } finally {
@@ -468,361 +270,482 @@ function App() {
         }
     };
 
-    // Ingestion Handlers
-    const handleAddUrl = async () => {
-        if (!currUrl) return;
-        setUploading(true);
+    const handleToggleSource = (filename) => {
+        const newSet = new Set(selectedSources);
+        if (newSet.has(filename)) newSet.delete(filename);
+        else newSet.add(filename);
+        setSelectedSources(newSet);
+    };
+
+    const handleToggleAllSources = () => {
+        if (selectedSources.size === availableFiles.length) {
+            setSelectedSources(new Set());
+        } else {
+            setSelectedSources(new Set(availableFiles));
+        }
+    };
+
+    const handleDeleteFile = async (filename) => {
+        if (!window.confirm(`Delete ${filename}?`)) return;
         try {
-            const res = await fetch('/api/ingest/url', {
+            const res = await authFetch('/api/delete', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: currUrl })
+                body: JSON.stringify({ filename })
             });
-            const data = await res.json();
             if (res.ok) {
-                alert('Success: ' + data.message);
-                setCurrUrl('');
-                setIsIngesting(true); // Start polling
-            } else {
-                alert('Error: ' + data.error);
-                setUploading(false);
+                const newSet = new Set(selectedSources);
+                newSet.delete(filename);
+                setSelectedSources(newSet);
+                refreshData();
             }
-        } catch (e) {
-            alert('Failed to add URL');
-        } finally {
-            setUploading(false);
-        }
+        } catch (e) { alert("Delete failed"); }
     };
 
-    const handleFileUpload = async (e) => {
-        const files = e.target.files;
-        if (!files || files.length === 0) return;
-
-        setUploading(true);
-        const formData = new FormData();
-
-        // Append all files
-        for (let i = 0; i < files.length; i++) {
-            formData.append('file', files[i]);
-        }
-
+    const handleDeleteAll = async () => {
+        if (!window.confirm('Delete ALL uploaded data and clear the knowledge DB? This will remove all files and Neo4j data.')) return;
         try {
-            const res = await fetch('/api/ingest/upload', {
-                method: 'POST',
-                body: formData // No Content-Type header needed, browser adds it with boundary
-            });
-            const data = await res.json();
+            const res = await authFetch('/api/admin/clear_db', { method: 'POST' });
             if (res.ok) {
-                alert('Success: ' + data.message);
-                openSettings(); // Refresh Trust Rules immediately
-                setIsIngesting(true); // Start polling
+                setSelectedSources(new Set());
+                refreshData();
+                alert('All data cleared successfully.');
             } else {
-                alert('Error: ' + data.error);
-                setUploading(false);
+                const data = await res.json();
+                alert(data.error || 'Failed to clear data');
             }
-        } catch (e) {
-            alert('Failed to upload file');
-            setUploading(false);
-        } finally {
-            e.target.value = null; // Reset input
-        }
+        } catch (e) { alert('Failed to clear data'); }
     };
 
-    const clearDatabase = async () => {
-        if (!window.confirm("ARE YOU SURE? This will delete ALL ingested data (Nodes, Text, Images) from the database. This cannot be undone.")) return;
-
+    const handleClearChat = async () => {
         try {
-            const res = await fetch('/api/admin/clear_db', { method: 'POST' });
-            const data = await res.json();
-            if (res.ok) {
-                showStatus('success', "Database Cleared: " + data.message);
-                await refreshSettingsData(); // Refresh immediately
-            } else {
-                showStatus('error', "Error: " + data.error);
-            }
-        } catch (e) {
-            showStatus('error', "Failed to clear database");
-        }
-    };
-
-    const clearChat = async () => {
-        try {
-            await fetch('/api/clear', {
+            await authFetch('/api/clear', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ session_id: sessionId })
             });
             setMessages([]);
-        } catch (error) {
-            console.error('Failed to clear chat:', error);
+        } catch (e) { }
+    };
+
+    const handleDeleteRule = async (index) => {
+        const newRules = config.rules.filter((_, i) => i !== index);
+        const newConfig = { ...config, rules: newRules };
+        try {
+            const res = await authFetch('/api/config/trust', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(newConfig)
+            });
+            if (res.ok) setConfig(newConfig);
+        } catch (e) { alert("Delete failed"); }
+    };
+
+    const handleAddUrl = async () => {
+        if (!currUrl) return;
+        setUploading(true);
+        try {
+            const res = await authFetch('/api/ingest/url', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: currUrl })
+            });
+            if (res.ok) {
+                setCurrUrl('');
+                setIsIngesting(true);
+            } else {
+                const data = await res.json();
+                alert(data.error);
+                setUploading(false);
+            }
+        } catch (e) { setUploading(false); }
+    };
+
+    const handleUploadFiles = async (e, isFolder = false) => {
+        const files = e.target.files;
+        if (!files || files.length === 0) return;
+        setUploading(true);
+        const formData = new FormData();
+
+        for (let f of files) {
+            formData.append('file', f);
+            if (isFolder && f.webkitRelativePath) {
+                formData.append('paths', f.webkitRelativePath);
+            }
         }
+
+        try {
+            const res = await authFetch('/api/ingest/upload', { method: 'POST', body: formData });
+            if (res.ok) {
+                setIsIngesting(true);
+                refreshData();
+            } else {
+                const data = await res.json();
+                alert(data.error);
+                setUploading(false);
+            }
+        } catch (e) { setUploading(false); }
     };
 
-    const openLightbox = (imageSrc) => {
-        setLightboxImage(imageSrc);
+    // --- Render Helpers ---
+
+    const processInlineMarkdown = (text) => {
+        const parts = text.split(/(\*\*.*?\*\*)|(!\[.*?\]\(.*?\))/g);
+        return parts.map((part, index) => {
+            if (!part) return null;
+            if (part.startsWith('**') && part.endsWith('**')) return <strong key={index}>{part.slice(2, -2)}</strong>;
+            if (part.match(/^!\[(.*?)\]\((.*?)\)$/)) {
+                const match = part.match(/^!\[(.*?)\]\((.*?)\)$/);
+                return (
+                    <img key={index} src={match[2]} alt={match[1]} onClick={() => setLightboxImage(match[2])} className="message-inline-img" />
+                );
+            }
+            return part;
+        });
     };
 
-    const closeLightbox = () => {
-        setLightboxImage(null);
+    const formatMessage = (content) => {
+        const lines = content.split('\n');
+        const formatted = [];
+        let tableRows = [];
+
+        lines.forEach((line, idx) => {
+            if (line.trim().startsWith('|')) {
+                tableRows.push(line);
+            } else {
+                if (tableRows.length > 0) {
+                    formatted.push(<div key={`table-${idx}`} className="markdown-table">{renderTable(tableRows)}</div>);
+                    tableRows = [];
+                }
+                if (line.trim()) {
+                    if (line.startsWith('###')) formatted.push(<h3 key={idx}>{processInlineMarkdown(line.replace(/^###\s*/, ''))}</h3>);
+                    else if (line.trim().startsWith('-')) formatted.push(<li key={idx}>{processInlineMarkdown(line.trim().substring(1).trim())}</li>);
+                    else formatted.push(<p key={idx}>{processInlineMarkdown(line)}</p>);
+                }
+            }
+        });
+        if (tableRows.length > 0) formatted.push(<div key="table-final" className="markdown-table">{renderTable(tableRows)}</div>);
+        return formatted;
     };
 
-    return (
-        <div className="app-container">
-            {view === 'settings' ? (
-                <div className="settings-page">
-                    <div className="settings-container-full">
-                        <div className="settings-header">
-                            <h2>⚙️ Settings & Data</h2>
-                            <button onClick={() => setView('chat')} className="btn-secondary">
-                                ← Back to Chat
-                            </button>
+    const renderTable = (rows) => {
+        const tableData = rows.map(row => row.split('|').filter(cell => cell.trim()).map(cell => cell.trim()));
+        if (tableData.length < 2) return null;
+        const headers = tableData[0];
+        const dataRows = tableData.slice(2);
+        return (
+            <table>
+                <thead><tr>{headers.map((h, i) => <th key={i}>{processInlineMarkdown(h)}</th>)}</tr></thead>
+                <tbody>{dataRows.map((row, i) => <tr key={i}>{row.map((c, j) => <td key={j}>{processInlineMarkdown(c)}</td>)}</tr>)}</tbody>
+            </table>
+        );
+    };
+
+    // --- Layout Components ---
+
+    const Sidebar = () => (
+        <div className="sidebar">
+            <div className="sidebar-logo">
+                <span style={{ fontSize: '1.5rem' }}>🌌</span>
+                <span>Hybrid RAG</span>
+            </div>
+            <div className="sidebar-nav">
+                <button className={`nav-item ${activeView === 'chat' ? 'active' : ''}`} onClick={() => setActiveView('chat')}>
+                    <span>💬</span> Chat Assistant
+                </button>
+                {isAdmin && (
+                    <button className={`nav-item ${activeView === 'settings' ? 'active' : ''}`} onClick={() => setActiveView('settings')}>
+                        <span>⚙️</span> Settings &amp; Data
+                    </button>
+                )}
+            </div>
+            <div className="sidebar-footer">
+                <div style={{ padding: '8px 16px', fontSize: '0.8rem', color: '#9ca3af', marginBottom: '4px' }}>
+                    <div style={{ fontWeight: 600, color: '#e5e7eb' }}>{currentUser?.username}</div>
+                    <div style={{ marginTop: '2px' }}>{ROLE_BADGE[currentUser?.role] || currentUser?.role}</div>
+                </div>
+                <button className="nav-item" onClick={handleClearChat}>
+                    <span>🗑️</span> Clear History
+                </button>
+                <button className="nav-item" onClick={handleLogout} style={{ color: '#f87171' }}>
+                    <span>🚪</span> Sign Out
+                </button>
+            </div>
+        </div>
+    );
+
+    const ChatView = () => (
+        <div className="chat-root" style={{ position: 'relative' }}>
+            <header className="chat-header">
+                <h1>AI Assistant</h1>
+                <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                    {isIngesting && (
+                        <div className="ingest-indicator">
+                            <div className="spinner" style={{ width: '14px', height: '14px', borderWidth: '2px' }}></div>
+                            <span>{ingestStatus.message || 'Ingesting...'}</span>
                         </div>
+                    )}
+                    <span style={{ fontSize: '0.85rem', color: '#6b7280' }}>
+                        {isCreative ? 'Creative' : 'Precise'} Mode
+                    </span>
+                </div>
+            </header>
 
-                        <div className="settings-content">
-                            <div className="setting-group">
-                                <label className="checkbox-label">
-                                    <input
-                                        type="checkbox"
-                                        checked={isCreative}
-                                        onChange={(e) => setIsCreative(e.target.checked)}
-                                    />
-                                    Creative Mode (Temp 0.3)
-                                </label>
-                                <p className="setting-desc">
-                                    Creative mode gives more natural answers. Uncheck for Precise Mode (0.0).
-                                </p>
-                            </div>
-
-                            <h3>Add Data Source</h3>
-                            <div className="ingest-section">
-                                <div className="ingest-row">
-                                    <input
-                                        type="text"
-                                        placeholder="Enter Website URL (e.g. https://example.com/spec)"
-                                        value={currUrl}
-                                        onChange={(e) => setCurrUrl(e.target.value)}
-                                        className="input-dark"
-                                    />
-                                    <button
-                                        onClick={handleAddUrl}
-                                        disabled={uploading}
-                                        className="btn-primary"
-                                    >
-                                        {uploading ? 'Processing...' : 'Crawl URL'}
-                                    </button>
-                                </div>
-
-                                <div
-                                    className={`ingest-row upload-row drop-zone ${isDragging ? 'drag-active' : ''}`}
-                                    onDragEnter={handleDrag}
-                                    onDragOver={handleDrag}
-                                    onDragLeave={handleDrag}
-                                    onDrop={handleDrop}
-                                    style={{
-                                        flexDirection: 'column',
-                                        alignItems: 'center',
-                                        gap: '15px',
-                                        border: isDragging ? '2px dashed #4299e1' : '2px dashed #4a5568',
-                                        backgroundColor: isDragging ? 'rgba(66, 153, 225, 0.1)' : 'rgba(0, 0, 0, 0.2)',
-                                        padding: '30px',
-                                        borderRadius: '10px',
-                                        transition: 'all 0.2s ease',
-                                        cursor: 'default'
-                                    }}
-                                >
-                                    <div style={{ fontSize: '2rem' }}>📂</div>
-                                    <span style={{ color: '#a0aec0', fontWeight: 'bold' }}>Drag & Drop Files or Folders Here</span>
-                                    <span style={{ color: '#718096', fontSize: '0.9rem' }}>-- OR --</span>
-
-                                    <div style={{ display: 'flex', gap: '10px' }}>
-                                        {/* File Upload Button */}
-                                        <label className="btn-primary" style={{ cursor: 'pointer', margin: 0, fontSize: '0.9rem', padding: '8px 16px' }}>
-                                            Select Files manually
-                                            <input
-                                                type="file"
-                                                multiple
-                                                onChange={handleFileUpload}
-                                                disabled={uploading}
-                                                style={{ display: 'none' }}
-                                            />
-                                        </label>
-                                    </div>
-
-                                    {uploadStatus && (
-                                        <div style={{
-                                            padding: '8px 12px',
-                                            borderRadius: '6px',
-                                            fontSize: '0.9rem',
-                                            marginBottom: '8px',
-                                            width: '100%',
-                                            textAlign: 'center',
-                                            background: uploadStatus.type === 'success' ? '#d1fae5' : '#fee2e2',
-                                            color: uploadStatus.type === 'success' ? '#065f46' : '#991b1b',
-                                            border: uploadStatus.type === 'success' ? '1px solid #34d399' : '1px solid #f87171'
-                                        }}>
-                                            {uploadStatus.type === 'success' ? '✅ ' : '⚠️ '} {uploadStatus.msg}
-                                        </div>
-                                    )}
-                                    {uploading && <span className="status-text" style={{ color: '#48bb78' }}>Processing Upload...</span>}
-                                </div>
-                            </div>
-
-
-
-                            <h3>Trust Rules Configuration</h3>
-                            <div className="rules-table-container">
-                                <table className="rules-table">
-                                    <thead>
-                                        <tr>
-                                            <th>Data Source Pattern</th>
-                                            <th>Trust Score</th>
-                                            <th>Action</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {config.rules.map((rule, idx) => (
-                                            <tr key={idx}>
-                                                <td>{rule.pattern}</td>
-                                                <td>
-                                                    <input
-                                                        type="number"
-                                                        step="0.1" max="1.5" min="0"
-                                                        value={rule.score}
-                                                        onChange={(e) => updateRuleScore(idx, e.target.value)}
-                                                        className="score-input"
-                                                    />
-                                                </td>
-                                                <td>
-                                                    <button onClick={() => removeRule(idx)} className="btn-icon delete" title="Remove">×</button>
-                                                </td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-
-                            <div className="danger-zone" style={{ marginTop: '40px', paddingTop: '20px', borderTop: '1px solid #e53e3e' }}>
-                                <h3 style={{ color: '#e53e3e', borderBottom: 'none' }}>⚠️ Danger Zone</h3>
-                                <button onClick={clearDatabase} style={{ background: '#e53e3e', color: 'white', border: 'none', padding: '10px 20px', borderRadius: '8px', cursor: 'pointer' }}>
-                                    Clear Database (Purge All Data)
-                                </button>
-                                <p style={{ color: '#a0aec0', fontSize: '0.9rem', marginTop: '10px' }}>
-                                    Use this if ingestion extracted too much "trash" and you want to start fresh with the new filters.
-                                </p>
-                            </div>
-                        </div>
-                        <div className="modal-actions">
-                            <button onClick={() => setView('chat')} className="btn-secondary">Close</button>
-                            <button onClick={saveSettings} className="btn-primary">Save Changes</button>
-                        </div>
+            {isIngesting && (
+                <div className="progress-wrapper">
+                    <div className="progress-container">
+                        <div
+                            className="progress-bar-fill"
+                            style={{ width: `${ingestStatus.percent || 0}%` }}
+                        ></div>
                     </div>
                 </div>
-            ) : (
-                <div className="chat-container">
-                    <div className="chat-header">
-                        <div className="header-title">
-                            <h1>Hybrid RAG Assistant</h1>
+            )}
+
+            <div className="messages-container">
+                {messages.length === 0 && (
+                    <div style={{ textAlign: 'center', marginTop: '100px', color: '#9ca3af' }}>
+                        <div style={{ fontSize: '3rem', marginBottom: '16px' }}>👋</div>
+                        <h2>How can I help you today?</h2>
+                        <p>Ask about cars, specs, or upload documents to get started.</p>
+                    </div>
+                )}
+                {messages.map((msg, idx) => (
+                    <div key={idx} className={`message ${msg.type}`}>
+                        <div className="avatar">
+                            {msg.type === 'user' ? 'U' : (
+                                <span title={msg.agent}>
+                                    {msg.agent === 'visual' || msg.agent === 'image' ? '📸' :
+                                        msg.agent === 'table' ? '📊' : '🤖'}
+                                </span>
+                            )}
                         </div>
-                        <div className="header-controls">
-                            <button onClick={openSettings} className="icon-btn" title="Settings">
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-                            </button>
-                            <button onClick={clearChat} className="icon-btn" title="Clear Chat">
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
-                            </button>
+                        <div className="message-body">
+                            {msg.type === 'bot' && msg.agent && (
+                                <div className="agent-badge">
+                                    {msg.agent === 'visual' || msg.agent === 'image' ? 'Image Agent' :
+                                        msg.agent === 'table' ? 'Table Agent' : 'Text Assistant'}
+                                </div>
+                            )}
+                            <div className="message-content">
+                                {msg.thought && (
+                                    <div className="thought-block">
+                                        <div className="thought-icon">🧠</div>
+                                        <div className="thought-text">{msg.thought}</div>
+                                    </div>
+                                )}
+                                {typeof msg.content === 'string' ? (
+                                    msg.content ? formatMessage(msg.content) :
+                                        (msg.thought ? null : <div className="typing-indicator"><span></span><span></span><span></span></div>)
+                                ) : msg.content}
+                            </div>
+                            {msg.sources?.length > 0 && (
+                                <div className="sources-chips">
+                                    {msg.sources.map((s, i) => (
+                                        <span key={i} className="source-chip" title={s.file}>
+                                            📄 {s.file.length > 15 ? s.file.substring(0, 12) + '...' : s.file} (p.{s.page})
+                                        </span>
+                                    ))}
+                                </div>
+                            )}
+                            {msg.images?.length > 0 && (
+                                <div className="image-grid">
+                                    {msg.images.map((img, i) => {
+                                        const src = img.startsWith('/api/images/') ? img : `/api/images/${img}`;
+                                        return (
+                                            <div key={i} className="image-card">
+                                                <img src={src} alt="Ref" onClick={() => setLightboxImage(src)} />
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                ))}
+                {loading && (
+                    <div className="message bot">
+                        <div className="avatar">AI</div>
+                        <div className="message-body">
+                            <div className="typing-indicator"><span></span><span></span><span></span></div>
+                        </div>
+                    </div>
+                )}
+                <div ref={messagesEndRef} />
+            </div>
+
+            <div className="input-area">
+                <form className="input-box" onSubmit={handleSendMessage}>
+                    <textarea
+                        rows="1"
+                        placeholder="Ask anything..."
+                        value={input}
+                        onChange={(e) => setInput(e.target.value)}
+                        onKeyDown={(e) => {
+                            if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault();
+                                handleSendMessage(e);
+                            }
+                        }}
+                    />
+                    <button type="submit" className="send-btn" disabled={!input.trim() || loading}>
+                        ➜
+                    </button>
+                </form>
+            </div>
+        </div>
+    );
+
+    const SettingsView = () => (
+        <div className="settings-view">
+            <div className="settings-container">
+                <h2 style={{ marginBottom: '32px', fontSize: '1.875rem' }}>System Settings</h2>
+
+                <div className="settings-grid">
+                    {/* Model Config */}
+                    <div className="settings-card">
+                        <h3>🧠 AI Configuration</h3>
+                        <div className="form-group">
+                            <label className="checkbox-label" style={{ display: 'flex', alignItems: 'center', gap: '12px', cursor: 'pointer' }}>
+                                <div className="toggle-switch">
+                                    <input type="checkbox" checked={isCreative} onChange={(e) => setIsCreative(e.target.checked)} />
+                                    <span className="slider"></span>
+                                </div>
+                                <div>
+                                    <div style={{ fontWeight: 600 }}>Creative Mode</div>
+                                    <div style={{ fontSize: '0.8rem', color: '#6b7280' }}>Uncheck for more precise/literal answers.</div>
+                                </div>
+                            </label>
                         </div>
                     </div>
 
-                    {isIngesting && (
-                        <div style={{ background: '#ebf8ff', padding: '12px 20px', borderBottom: '1px solid #e0e4e8' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px', fontSize: '0.9rem', color: '#2b6cb0' }}>
-                                <span><strong>Processing Data...</strong> {ingestStatus.message}</span>
-                                <span>{ingestStatus.percent}%</span>
+                    {/* Dataset Toggles */}
+                    <div className="settings-card" style={{ gridRow: 'span 2' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+                            <h3 style={{ margin: 0 }}>📂 Dataset Selection</h3>
+                            <div style={{ display: 'flex', gap: '8px' }}>
+                                <button className="btn-modern secondary" style={{ padding: '4px 8px', fontSize: '0.8rem' }} onClick={handleToggleAllSources}>
+                                    {selectedSources.size === availableFiles.length ? 'Deselect All' : 'Select All'}
+                                </button>
+                                {isSuperAdmin && (
+                                    <button className="btn-modern danger" style={{ padding: '4px 8px', fontSize: '0.8rem' }} onClick={handleDeleteAll}>
+                                        🗑️ Delete All
+                                    </button>
+                                )}
                             </div>
-                            <div style={{ width: '100%', height: '8px', background: '#bee3f8', borderRadius: '4px', overflow: 'hidden' }}>
-                                <div style={{ width: `${ingestStatus.percent}%`, height: '100%', background: '#3182ce', transition: 'width 0.5s ease' }}></div>
+                        </div>
+                        <div className="data-list">
+                            {availableFiles.length === 0 ? (
+                                <p style={{ color: '#9ca3af', fontStyle: 'italic' }}>No data uploaded yet.</p>
+                            ) : availableFiles.map((file, i) => (
+                                <div key={i} className="data-item">
+                                    <div className="data-info">
+                                        <span className="data-icon">{file.match(/\.(jpg|jpeg|png)$/i) ? '🖼️' : '📄'}</span>
+                                        <span className="data-name">{file}</span>
+                                    </div>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                        <div className="toggle-switch">
+                                            <input type="checkbox" checked={selectedSources.has(file)} onChange={() => handleToggleSource(file)} />
+                                            <span className="slider"></span>
+                                        </div>
+                                        <button className="btn-delete-small" onClick={() => handleDeleteFile(file)}>🗑️</button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                        <div style={{ marginTop: '20px', fontSize: '0.85rem', color: '#6b7280', background: '#fef3c7', padding: '12px', borderRadius: '8px' }}>
+                            💡 <strong>Tip:</strong> Toggle sources to restrict the AI to only specific documents.
+                        </div>
+                    </div>
+
+                    {/* Ingestion — admin only */}
+                    {isAdmin && (
+                        <div className="settings-card">
+                            <h3>📤 Add New Knowledge</h3>
+                            <div className="form-group">
+                                <label className="form-label">Crawl Website</label>
+                                <div style={{ display: 'flex', gap: '8px' }}>
+                                    <input className="input-dark" type="text" placeholder="https://..." value={currUrl} onChange={e => setCurrUrl(e.target.value)} />
+                                    <button className="btn-modern primary" onClick={handleAddUrl} disabled={uploading}>Crawl</button>
+                                </div>
+                            </div>
+                            <div className="form-group">
+                                <label className="form-label">Upload Knowledge</label>
+                                <div style={{ display: 'flex', gap: '8px', flexDirection: 'column' }}>
+                                    <input type="file" multiple onChange={(e) => handleUploadFiles(e)} style={{ fontSize: '0.85rem' }} disabled={uploading} />
+                                    <div style={{ display: 'flex', gap: '8px' }}>
+                                        <button
+                                            className="btn-modern secondary"
+                                            style={{ flex: 1, fontSize: '0.85rem' }}
+                                            onClick={() => document.getElementById('folder-upload').click()}
+                                            disabled={uploading}
+                                        >
+                                            📁 Upload Folder
+                                        </button>
+                                        <input
+                                            type="file"
+                                            id="folder-upload"
+                                            style={{ display: 'none' }}
+                                            webkitdirectory="true"
+                                            directory="true"
+                                            multiple
+                                            onChange={(e) => handleUploadFiles(e, true)}
+                                        />
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     )}
 
-                    <div className="messages-container">
-                        {messages.map((msg, idx) => (
-                            <div key={idx} className={`message ${msg.type}`}>
-                                <div className="message-content">
-                                    {typeof msg.content === 'string' ? formatMessage(msg.content) : msg.content}
-                                </div>
-
-                                {msg.sources && msg.sources.length > 0 && (
-                                    <div className="sources">
-                                        <strong>Sources:</strong>
-                                        <ul>
-                                            {msg.sources.map((src, i) => (
-                                                <li key={i}>{src.file} (Page {src.page})</li>
-                                            ))}
-                                        </ul>
-                                    </div>
-                                )}
-
-                                {msg.images && msg.images.length > 0 && (
-                                    <div className="images">
-                                        <strong>Images:</strong>
-                                        <div className="image-grid">
-                                            {msg.images.map((img, i) => (
-                                                <div key={i} className="image-item">
-                                                    <img
-                                                        src={`/images/${img}`}
-                                                        alt={`Reference ${i + 1}`}
-                                                        onClick={() => openLightbox(`/images/${img}`)}
-                                                    />
-                                                </div>
-                                            ))}
-                                        </div>
-                                    </div>
-                                )}
-                            </div>
-                        ))}
-
-                        {loading && (
-                            <div className="message bot loading">
-                                <div className="typing-indicator">
-                                    <span></span>
-                                    <span></span>
-                                    <span></span>
-                                </div>
-                            </div>
-                        )}
-
-                        <div ref={messagesEndRef} />
+                    {/* Trust Rules */}
+                    <div className="settings-card" style={{ gridColumn: '1 / -1' }}>
+                        <h3>⚖️ Trust & Scoring Rules</h3>
+                        <table className="modern-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+                            <thead>
+                                <tr>
+                                    <th style={{ padding: '12px' }}>Pattern</th>
+                                    <th>Trust Score</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {config.rules.map((rule, idx) => (
+                                    <tr key={idx}>
+                                        <td style={{ padding: '12px' }}>{rule.pattern}</td>
+                                        <td>{rule.score}</td>
+                                        <td>
+                                            <button
+                                                className="btn-delete-small"
+                                                onClick={() => handleDeleteRule(idx)}
+                                            >
+                                                🗑️ Delete
+                                            </button>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
                     </div>
+                </div>
+            </div>
+        </div>
+    );
 
-                    <form onSubmit={sendMessage} className="input-container">
-                        <div className="input-wrapper">
-                            <input
-                                type="text"
-                                value={input}
-                                onChange={(e) => setInput(e.target.value)}
-                                placeholder="Ask me anything..."
-                                disabled={loading}
-                            />
-                        </div>
-                        <button type="submit" disabled={loading || !input.trim()}>
-                            ➜
-                        </button>
-                    </form>
+    return (!token || !currentUser) ? <LoginScreen /> : (
+        <div className="app-container">
+            <Sidebar />
+            <main className="main-content">
+                {activeView === 'chat' ? <ChatView /> : <SettingsView />}
+            </main>
+
+            {lightboxImage && (
+                <div className="lightbox-overlay" onClick={() => setLightboxImage(null)}>
+                    <div className="lightbox-content">
+                        <img src={lightboxImage} alt="Large" />
+                    </div>
                 </div>
             )}
-
-            {
-                lightboxImage && (
-                    <div className="lightbox-overlay" onClick={closeLightbox}>
-                        <div className="lightbox-content" onClick={(e) => e.stopPropagation()}>
-                            <button className="lightbox-close" onClick={closeLightbox}>×</button>
-                            <img src={lightboxImage} alt="Full size" />
-                        </div>
-                    </div>
-                )
-            }
-        </div >
+        </div>
     );
 }
 

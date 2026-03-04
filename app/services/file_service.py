@@ -3,47 +3,51 @@ import shutil
 import json
 import logging
 from app.config import Config
-from app.services.ingest_service import IngestService
+
 
 logger = logging.getLogger(__name__)
+
 
 class FileService:
     """Service to handle file uploads, deletions, and ingestion."""
 
     @staticmethod
-    def upload_file(file, strategy: str = "dlt"):
-        """Saves file and triggers ingestion."""
-        if not file or file.filename == '':
-            raise ValueError("No file selected")
-            
-        filename = file.filename
-        file_path = os.path.join(Config.DATA_DIR, filename)
-        
-        # Save File
-        file.save(file_path)
-        logger.info(f"File saved to {file_path}")
-        
-        # Determine Type and Ingest
-        try:
-            # Using IngestService Facade
-            # This runs ingestion synchronously (blocking). 
-            # In a real app, this should be a background task (Celery/Redis Queue).
-            IngestService.ingest_document(file_path, strategy=strategy)
-            
-            return {"status": "success", "message": f"Successfully ingested {filename} using {strategy}"}
-        except Exception as e:
-            logger.error(f"Ingestion failed: {e}")
-            raise e
-
-    @staticmethod
     def list_files():
-        """Lists files in DATA_DIR."""
+        """Lists files in DATA_DIR recursively (skips derived folders)."""
         try:
             files = []
-            if os.path.exists(Config.DATA_DIR):
-                for f in os.listdir(Config.DATA_DIR):
-                    if os.path.isfile(os.path.join(Config.DATA_DIR, f)) and not f.startswith('.'):
-                         files.append(f)
+            if not os.path.exists(Config.DATA_DIR):
+                return files
+
+            # Names to ignore (case-insensitive)
+            exclude = {"urls.txt", "url.txt", "source_config.json", "ingest_status.json", "chat_sessions.json", "crawl_history.json"}
+
+            # Walk recursively but skip bulky or derived folders like dlt_output and extracted_images
+            skip_dirs = {"dlt_output", "extracted_images"}
+
+            for root, dirs, filenames in os.walk(Config.DATA_DIR):
+                # Determine relative root from DATA_DIR
+                rel_root = os.path.relpath(root, Config.DATA_DIR)
+                parts = [] if rel_root in ('.', os.curdir) else rel_root.split(os.sep)
+                # If any part of the path is a skip dir, don't traverse into it
+                if any(part in skip_dirs for part in parts):
+                    dirs[:] = [d for d in dirs if d not in skip_dirs]
+                    continue
+
+                for f in filenames:
+                    if f.startswith('.'):
+                        continue
+                    if f.lower() in exclude:
+                        continue
+                    # Build a relative path so the frontend can preserve folder structure
+                    if rel_root == '.' or rel_root == os.curdir:
+                        rel_path = f
+                    else:
+                        rel_path = os.path.join(rel_root, f)
+                    files.append(rel_path)
+
+            # Sort for deterministic ordering
+            files.sort()
             return files
         except Exception as e:
             logger.error(f"List files failed: {e}")
@@ -56,14 +60,14 @@ class FileService:
             file_path = os.path.join(Config.DATA_DIR, filename)
             if os.path.exists(file_path):
                 os.remove(file_path)
-                
+
             # Also clean up extracted images folder?
             # Logic from api.py:
             base_name = os.path.splitext(filename)[0]
             img_dir = os.path.join(Config.DATA_DIR, "extracted_images", base_name)
             if os.path.exists(img_dir):
                 shutil.rmtree(img_dir)
-                
+
             return {"status": "success", "message": f"Deleted {filename}"}
         except Exception as e:
             logger.error(f"Delete file failed: {e}")
@@ -71,23 +75,30 @@ class FileService:
 
     @staticmethod
     def clear_database():
-        """Wipes Neo4j and local artifacts."""
+        """Wipes Neo4j, local artifacts, and resets Trust Rules config."""
         try:
             from app.database import get_db_connection
             graph = get_db_connection()
             graph.query("MATCH (n) DETACH DELETE n")
-            
-            # Clear Data Dir (except keep .keep files if any)
-            # Logic from api.py is to verify what to keep.
-            # Simplified:
+
+            # Clear Data Dir (keep .json config files but reset sessions)
             if os.path.exists(Config.DATA_DIR):
                 for f in os.listdir(Config.DATA_DIR):
-                    if f.endswith('.json'): continue # Keep config/sessions?
+                    if f.endswith('.json'): continue  # Keep config/sessions
                     p = os.path.join(Config.DATA_DIR, f)
                     if os.path.isfile(p): os.remove(p)
                     elif os.path.isdir(p): shutil.rmtree(p)
-            
-            return {"status": "success", "message": "Database and artifacts cleared."}
+
+            # Also reset Trust Rules config so UI reflects clean state
+            trust_config = {
+                "strict_mode": True,
+                "rules": [],
+                "default_score": 0.5
+            }
+            with open(Config.TRUST_CONFIG_FILE, 'w') as f:
+                json.dump(trust_config, f, indent=4)
+
+            return {"status": "success", "message": "Database, artifacts, and Trust Rules cleared."}
         except Exception as e:
             logger.error(f"Clear DB failed: {e}")
             raise e

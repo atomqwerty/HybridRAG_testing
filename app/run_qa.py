@@ -30,9 +30,7 @@ def preprocess_thai_query(query: str) -> str:
         logger.warning(f"Thai tokenization failed: {e}")
         return query
 
-# 1. Connect to Neo4j
-# 1. Connect to Neo4j
-# 1. Lazy Connection Logic
+# Lazy Neo4j Connection
 _GRAPH = None
 
 def get_graph():
@@ -46,9 +44,9 @@ def get_graph():
         _GRAPH = get_db_connection()
         
         # Create Indices on first connect
-        create_vector_index(_GRAPH, dimensions=Config.EMBEDDING_DIMENSION) 
+        create_vector_index(_GRAPH, dimensions=Config.EMBEDDING_DIMENSION)
         from app.database import create_text_vector_index
-        create_text_vector_index(_GRAPH, dimensions=3072)
+        create_text_vector_index(_GRAPH, dimensions=Config.EMBEDDING_DIMENSION)
         create_fulltext_index(_GRAPH)
         
         logger.info("✅ Neo4j Connection & Indices Ready.")
@@ -58,12 +56,21 @@ def get_graph():
         # Return None or raise? Raising is better to fail gracefully per request
         raise e
 
-# 2. Initialize Models
-embeddings = OpenAIEmbeddings(
-     model=Config.OPENAI_EMBEDDING_MODEL, 
-     openai_api_base=Config.OPENAI_BASE_URL,
-     openai_api_key=Config.OPENAI_API_KEY
-)
+# 2. Lazy-load Embeddings (reads Config at call-time, not import-time)
+_EMBEDDINGS = None
+
+def get_embeddings():
+    global _EMBEDDINGS
+    if _EMBEDDINGS is None:
+        logger.info(f"Loading embeddings model: {Config.OPENAI_EMBEDDING_MODEL} via {Config.OPENAI_EMBEDDING_BASE_URL}")
+        _EMBEDDINGS = OpenAIEmbeddings(
+            model=Config.OPENAI_EMBEDDING_MODEL,
+            openai_api_base=Config.OPENAI_EMBEDDING_BASE_URL,
+            openai_api_key=Config.OPENAI_EMBEDDING_API_KEY
+        )
+    return _EMBEDDINGS
+
+
 
 # Global Cache for Cross-Encoder
 _CROSS_ENCODER_MODEL = None
@@ -126,17 +133,24 @@ def retrieve_graph_context(graph, llm, question: str, limit: int = 15) -> str:
         logger.error(f"Graph search failed: {e}")
         return ""
 
-def vector_retrieve(graph, embeddings, question, k=10, min_score=0.5, route="fast_fact"):
+def vector_retrieve(graph, embeddings, question, k=10, min_score=0.5, route="fast_fact", selected_sources=None):
     """Gets relevant text chunks using Vector Similarity. Boosts Vision chunks if Visual intent."""
     q_embedding = embeddings.embed_query(question)
     
-    # Boost Visual Chunks if route is visual
-    visual_boost = 0.2 if route == "visual_layout" else 0.0
+    selected_sources = selected_sources or []
     
+    # Visual boost: read from Config or default to 0.25
+    try:
+        visual_boost = float(getattr(__import__('app.config', fromlist=['Config']).Config, 'VISUAL_BOOST', 0.25))
+    except Exception:
+        visual_boost = 0.25
+
     result = graph.query("""
         CALL db.index.vector.queryNodes('text_vector_index', $k, $embedding)
         YIELD node, score
         WHERE score >= $min_score
+        // Support source-level selection: allow passing filenames (endsWith) instead of exact match
+        AND (size($selected_sources) = 0 OR any(s IN $selected_sources WHERE toString(node.source) ENDS WITH s))
         
         // --- Context Window Retrieval (Extended to +/- 2) ---
         // 1. Prev Chunks
@@ -159,7 +173,7 @@ def vector_retrieve(graph, embeddings, question, k=10, min_score=0.5, route="fas
 
         RETURN full_context AS text, node.source AS source, node.page AS page, best_image_path AS image_path, final_score AS score
         ORDER BY final_score DESC
-    """, {"embedding": q_embedding, "k": k, "min_score": min_score, "boost": visual_boost})
+    """, {"embedding": q_embedding, "k": k, "min_score": min_score, "boost": visual_boost, "selected_sources": selected_sources})
     
     return result
 
@@ -172,7 +186,7 @@ def create_chunk_fulltext_index(graph):
     except Exception as e:
         logger.error(f"Could not create chunk fulltext index: {e}")
 
-def keyword_retrieve(graph, question, k=5):
+def keyword_retrieve(graph, question, k=5, selected_sources=None):
     """Retrieves chunks using Keyword Search."""
     # Thai Text Preprocessing
     question = preprocess_thai_query(question)
@@ -210,6 +224,7 @@ def keyword_retrieve(graph, question, k=5):
     query = """
         CALL db.index.fulltext.queryNodes("chunk_text_index", $query, {limit: $k})
         YIELD node, score
+        WHERE (size($selected_sources) = 0 OR any(s IN $selected_sources WHERE toString(node.source) ENDS WITH s))
         
         // --- Page-Level Retrieval: Get ALL chunks from the same page ---
         MATCH (page_chunk:Chunk)
@@ -231,7 +246,8 @@ def keyword_retrieve(graph, question, k=5):
         """
     
     try:
-        results = graph.query(query, {"query": lucene_query, "k": k})
+        selected_sources = selected_sources or []
+        results = graph.query(query, {"query": lucene_query, "k": k, "selected_sources": selected_sources})
         return results
     except Exception as e:
         logger.error(f"Keyword search failed: {e}")
@@ -257,8 +273,9 @@ def reciprocal_rank_fusion(results_lists, k=60):
     reranked_results.sort(key=lambda x: x['rrf_score'], reverse=True)
     return reranked_results
 
-def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact"):
+def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact", selected_sources=None):
     """Combines Graph, Vector, and Keyword context. Adapts to Route."""
+    selected_sources = selected_sources or []
     create_fulltext_index(graph)
     create_chunk_fulltext_index(graph)
     
@@ -271,7 +288,7 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
 
     # 2. HYBRID SEARCH
     k_res = 20 if is_broad_query else 15
-    keyword_ctx = keyword_retrieve(graph, question, k=k_res)
+    keyword_ctx = keyword_retrieve(graph, question, k=k_res, selected_sources=selected_sources)
     logger.info(f"📊 Keyword Retrieval: {len(keyword_ctx)} results")
     
     # Vector Search (Multi-Query)
@@ -291,7 +308,7 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
     for q in queries_to_run:
         # Pass route to vector_retrieve for boosting
         k_vec = 15 if is_broad_query else 10
-        res = vector_retrieve(graph, embeddings, q, k=k_vec, min_score=0.50, route=route)
+        res = vector_retrieve(graph, embeddings, q, k=k_vec, min_score=0.50, route=route, selected_sources=selected_sources)
         for r in res:
             vector_results_map[r['text']] = r 
             
@@ -334,6 +351,17 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
             # Clean HTML tags more aggressively (including encoded)
             text = str(text).replace('&lt;', '<').replace('&gt;', '>')
             text = re.sub(r'<[^>]+>', ' ', text)
+            
+            # --- FIX: Sanitize absolute paths in text content ---
+            # If text contains [IMAGE PATH: /app/data/...] or similar, replace with /api/images/filename
+            def replace_abs_path(match):
+                full_path = match.group(1)
+                filename = os.path.basename(full_path)
+                return f"[IMAGE PATH: /api/images/{filename}]"
+            
+            text = re.sub(r'\[IMAGE PATH: (.*?)\]', replace_abs_path, text)
+            # ----------------------------------------------------
+
             context += f"- {text} [Source: {src}, Page: {pg}]\n"
             
             # Logic to deduplicate images
@@ -342,13 +370,13 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
                 if not img_p.startswith('/api/images/') and not img_p.startswith('http'):
                      # Ensure we don't double prepend if path includes subdir
                      # Assuming basic file serving pattern
-                     img_p = f"/api/images/{img_p.split('/')[-1]}"
+                     filename = os.path.basename(img_p)
+                     img_p = f"/api/images/{filename}"
                 
                 if img_p not in seen_images:
                     context += f" [IMAGE PATH: {img_p}]\n"
                     seen_images.add(img_p)
                     logger.info(f"Adding Image Path to Context: {img_p}")
-                    seen_images.add(img_p)
             elif str(src).lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                 # Fallback for image-only chunks if path is missing
                 img_src = src
@@ -427,8 +455,27 @@ def _rerank_with_llm(question, results, top_k=3, llm_model=None):
     return scored_results[:top_k]
 
 def _rerank_with_cohere(question, results, top_k=3):
-    # Implementation similar to original but logging errors
-    return results[:top_k] # Placeholder if no key
+    """Rerank using Cohere API. Requires COHERE_API_KEY in env."""
+    try:
+        import cohere
+        if not Config.COHERE_API_KEY:
+            logger.warning("[Reranker] RERANKER_METHOD=cohere but COHERE_API_KEY is not set. Falling back to top-k slice.")
+            return results[:top_k]
+        co = cohere.Client(Config.COHERE_API_KEY)
+        docs = [r['text'][:512] for r in results]
+        response = co.rerank(query=question, documents=docs, top_n=top_k, model='rerank-multilingual-v3.0')
+        reranked = []
+        for hit in response.results:
+            r = results[hit.index].copy()
+            r['combined_score'] = hit.relevance_score
+            reranked.append(r)
+        return reranked
+    except ImportError:
+        logger.warning("[Reranker] cohere package not installed. pip install cohere")
+        return results[:top_k]
+    except Exception as e:
+        logger.error(f"[Reranker] Cohere reranking failed: {e}")
+        return results[:top_k]
 
 def _rerank_with_cross_encoder(question, results, top_k=3):
     try:
@@ -455,7 +502,7 @@ def _rerank_with_cross_encoder(question, results, top_k=3):
         logger.error(f"Cross-encoder reranking failed: {e}")
         return results[:top_k]
 
-def answer(question, history="", temperature=0.3):
+def answer(question, history="", temperature=0.3, selected_sources=None):
     """Final QA function using LCEL."""
     logger.info(f"Thinking about: {question}")
     
@@ -497,21 +544,13 @@ def answer(question, history="", temperature=0.3):
     if not graph:
         return {"result": "⚠️ System Initializing... Please wait 5 seconds and try again.", "context": ""}
 
-    context = hybrid_context(graph, embeddings, standalone_question, llm_model=dynamic_llm, route=route)
+    context = hybrid_context(graph, get_embeddings(), standalone_question, llm_model=dynamic_llm, route=route, selected_sources=selected_sources)
     
-    # --- DEBUG: Print Context for User to See ---
-    print("\n--- [DEBUG] RETRIEVED CONTEXT ---")
-    print(context)
-    print("--- [DEBUG] END CONTEXT ---\n")
-    # ------------------------------------------
+    logger.debug(f"Retrieved context length: {len(context)} chars")
     
     
     # CRITICAL INSTRUCTION AT THE TOP:
     template = """You are an intelligent Thai AI assistant (Hybrid RAG).
-    
-    # 1. AMBIGUITY CHECK (Execute in Order):
-    
-    # 1. AMBIGUITY CHECK (Execute in Order):
     
     # 1. AMBIGUITY CHECK (Execute in Order):
     
@@ -562,7 +601,6 @@ def answer(question, history="", temperature=0.3):
         "history": history,
         "context": context,
         "question": standalone_question,
-        "route": route
     })
     
     return {"result": response, "context": context}

@@ -30,7 +30,7 @@ log/
 node_modules/
 frontend/build/
 frontend/.env
-
+frontend/node_modules
 # IDE
 .vscode/
 .idea/

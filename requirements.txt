@@ -1,5 +1,7 @@
 flask
 flask-cors
+PyJWT>=2.8.0
+bcrypt>=4.0.0
 python-dotenv
 neo4j
 langchain
@@ -18,6 +20,8 @@ pdfplumber
 langchain-experimental
 docx2txt
 sentence-transformers
+
+cairosvg
 
 tiktoken
 langchain-text-splitters

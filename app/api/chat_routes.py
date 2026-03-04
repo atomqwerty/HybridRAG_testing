@@ -15,12 +15,13 @@ def chat():
         data = request.json
         if not data or 'message' not in data:
             return jsonify({"error": "Message is required"}), 400
-            
+
         message = data.get('message')
         session_id = data.get('session_id', 'default')
         temp = data.get('temperature', 0.0)
-        
-        response = ChatService.process_message(message, session_id, temp)
+        selected_sources = data.get('selected_sources', [])
+
+        response = ChatService.process_message(message, session_id, temp, selected_sources=selected_sources)
         return jsonify(response)
         
     except Exception as e:
@@ -31,15 +32,20 @@ def chat():
 def chat_stream():
     """
     Streaming Chat Endpoint.
-    Body: { "message": "...", "session_id": "..." }
+    Body: { "message": "...", "session_id": "...", "selected_sources": [] }
     """
     try:
         data = request.json
-        message = data.get('message', '')
-        session_id = data.get('session_id', 'default')
+        message = data.get('message', '') if data else ''
+        session_id = data.get('session_id', 'default') if data else 'default'
+        temp = data.get('temperature', 0.0) if data else 0.0
+        selected_sources = data.get('selected_sources', []) if data else []
+        
+        if not message:
+            return jsonify({"error": "message is required"}), 400
         
         def generate():
-            for chunk in ChatService.process_stream(message, session_id):
+            for chunk in ChatService.process_stream(message, session_id, temp, selected_sources=selected_sources):
                 yield chunk
                 
         return Response(stream_with_context(generate()), mimetype='application/x-ndjson')
