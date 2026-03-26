@@ -30,7 +30,7 @@ log/
 node_modules/
 frontend/build/
 frontend/.env
-
+frontend/node_modules
 # IDE
 .vscode/
 .idea/
@@ -47,3 +47,4 @@ Test
 __pycache__
 /data
 check_url_ingestion.py
+source_config.json

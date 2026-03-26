@@ -31,7 +31,38 @@
 
 ---
 
-## 🛠️ การติดตั้ง (Installation)
+## ⚡ Quick Setup & Start Guide (เริ่มใช้งานด่วน)
+
+ทำตาม 4 ขั้นตอนง่ายๆ เพื่อรันระบบ Hybrid RAG ทั้งหมดบนเครื่องของคุณ:
+
+**1. เปิดฐานข้อมูล (Database)**
+```bash
+docker compose up -d
+```
+
+**2. ตั้งค่า Backend & API**
+ใส่คีย์ `OpenAi_api` และข้อมูลเชื่อมต่อ `Neo4j` ในไฟล์ `.env` (ดูได้ที่หัวข้อ การตั้งค่า) จากนั้นรัน:
+```bash
+pip install -r requirements.txt
+python api.py
+```
+*(API จะเปิดทำงานที่ `http://localhost:5000`)*
+
+**3. เปิดใช้งาน Frontend (หน้าเว็บ)**
+เปิด Terminal หน้าต่างใหม่ และรัน:
+```bash
+cd frontend
+npm install
+npm start
+```
+
+**4. เริ่มต้นใช้งานได้ทันที!**
+* เปิดเว็บเบราว์เซอร์ไปที่ `http://localhost:3000`
+* ล็อกอินบัญชีแอดมินเริ่มต้น: **Username**: `admin` | **Password**: `admin`
+
+---
+
+## 🛠️ การติดตั้ง (Installation) แบบละเอียด
 
 ### 1. ติดตั้ง Neo4j
 **ใช้ Docker-compose.yml สำหรับการติดตั้ง:**
@@ -134,19 +165,55 @@ Web Interface จะเปิดที่ `http://localhost:3000`
 
 ```
 HybridRAG_testing/
-├── ingest_graph.py          # นำเข้าข้อมูล
-├── run_qa.py                # แชทบอท CLI
-├── api.py                   # Flask API สำหรับ Web
-├── vision_utils.py          # จัดการรูปภาพ
-├── data/
-│   ├── *.pdf, *.docx, *.jpg # ไฟล์ต้นฉบับ
-│   ├── urls.txt             # URL เว็บไซต์
-│   └── extracted_images/    # รูปที่ดึงจาก PDF
-└── frontend/
-    ├── src/
-    │   ├── App.jsx          # React Component
-    │   └── App.css          # Styling
-    └── package.json
+├── main.py                        # App entrypoint
+├── docker-compose.yml             # Docker services
+├── Dockerfile
+├── requirements.txt
+├── source_config.json             # Trust Rules config
+│
+├── app/
+│   ├── __init__.py                # Flask app factory
+│   ├── config.py                  # All env vars & paths
+│   ├── router.py                  # Semantic route classifier
+│   ├── run_qa.py                  # Core hybrid RAG retrieval
+│   ├── crawler.py                 # Web scraper (Selenium + BS4)
+│   ├── database.py                # Neo4j index helpers
+│   ├── utils.py                   # update_status(), trust helpers
+│   ├── vision_utils.py            # Image encode / GPT-4o describe
+│   ├── mineru_utils.py            # MinerU PDF extraction
+│   │
+│   ├── agents/                    # ★ NEW: Multi-Agent system
+│   │   ├── supervisor.py          # Intent classifier → routes to agent
+│   │   ├── image_agent.py         # Graph Filter → Filtered Vector Search
+│   │   ├── table_agent.py         # Pandas + LLM code → Markdown table
+│   │   └── text_agent.py          # Wrapper around run_qa hybrid RAG
+│   │
+│   ├── api/                       # Flask Blueprints
+│   │   ├── chat_routes.py         # /api/chat, /api/chat/stream
+│   │   ├── file_routes.py         # /api/ingest/*, /api/config/trust, etc.
+│   │   └── crawl_routes.py        # /api/crawl/*, /api/export/*
+│   │
+│   ├── ingest/                    # Ingestion strategies
+│   │   ├── base.py                # Abstract BaseIngestor
+│   │   ├── dlt_ingest.py          # DLT pipeline (primary)
+│   │   └── native_ingest.py       # Native Python (placeholder)
+│   │
+│   └── services/                  # Business logic layer
+│       ├── chat_service.py        # Orchestrates Supervisor → Agents
+│       ├── crawl_service.py       # Job queue + crawl execution
+│       ├── file_service.py        # File save, delete, clear DB
+│       └── ingest_service.py      # Facade for ingest strategies
+│
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx                # Main React component
+│   │   └── App.css
+│   └── package.json
+│
+├── scripts/                       # Utility & test scripts
+└── data/                          # Runtime data (gitignored)
+    ├── extracted_images/
+    └── chat_sessions.json
 ```
 
 ---
@@ -202,3 +269,79 @@ HybridRAG_testing/
 ---
 
 **พัฒนาด้วย ❤️ โดย Hybrid RAG Team**
+
+---
+
+## 🔌 API Reference
+
+Base URL: `http://localhost:8080/api`
+
+### Chat
+
+| Method | Endpoint | Body | Description |
+|---|---|---|---|
+| POST | `/chat` | `{message, session_id, temperature}` | Standard blocking chat |
+| POST | `/chat/stream` | `{message, session_id}` | Streaming NDJSON response |
+
+### Ingestion & Files
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/ingest/upload` | Upload file(s) → background ingestion (returns 202) |
+| POST | `/ingest/url` | Crawl URL → background ingestion (returns 202) |
+| GET | `/ingest/status` | Poll progress `{percent, message, status}` |
+| GET | `/files` | List uploaded files |
+| POST | `/delete` | Delete a file `{filename}` |
+| GET | `/download/<filename>` | Download a raw file |
+| POST | `/admin/clear_db` | Wipe Neo4j + Trust Rules |
+| GET | `/config/trust` | Get trust rules config |
+| POST | `/config/trust` | Save trust rules config |
+| DELETE | `/source` | Delete Neo4j nodes by source pattern `{pattern}` |
+| POST | `/clear` | Clear session chat history `{session_id}` |
+| GET | `/images/<filename>` | Serve a stored image file |
+
+### Crawler Jobs
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/crawl` | Submit a new crawl job |
+| GET | `/crawl/<job_id>` | Poll job status & results |
+| DELETE | `/crawl/<job_id>` | Cancel a running job |
+| GET | `/results/<job_id>` | Fetch scraped page results |
+| GET | `/export/<job_id>` | Export results `?format=json\|csv\|xml` |
+| GET | `/crawl/queue` | List all pending jobs |
+| POST | `/crawl/queue/pause` | Pause the job queue |
+| POST | `/crawl/queue/resume` | Resume the job queue |
+
+---
+
+## 🤖 Multi-Agent Architecture
+
+```
+User Message
+     │
+     ▼
+ Supervisor (app/agents/supervisor.py)
+  - Keyword fast-path (visual / table keywords)
+  - LLM intent classification fallback
+  - Extracts car model entity name
+     │
+     ├── intent="visual"  ──▶ ImageAgent (app/agents/image_agent.py)
+     │                          1. Graph Filter: find Car node by entity name
+     │                          2. Filtered Vector Search (restricted to that source)
+     │
+     ├── intent="table"   ──▶ TableAgent (app/agents/table_agent.py)
+     │                          1. Load Car specs from Neo4j → Pandas DataFrame
+     │                          2. LLM generates Pandas code → Markdown table
+     │
+     └── intent="text"    ──▶ TextAgent (app/agents/text_agent.py)
+                                Wraps existing hybrid RAG (run_qa.py)
+```
+
+| File | Role |
+|---|---|
+| `app/agents/supervisor.py` | Intent classification + entity extraction |
+| `app/agents/image_agent.py` | Graph-filtered image retrieval |
+| `app/agents/table_agent.py` | Pandas spec comparison |
+| `app/agents/text_agent.py` | General hybrid RAG wrapper |
+| `app/services/chat_service.py` | Orchestration: Supervisor → Agent dispatch |

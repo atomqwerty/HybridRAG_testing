@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
-from config import Config
+from app.config import Config
 
 def setup_logger(name=__name__):
     """
@@ -27,15 +27,21 @@ def setup_logger(name=__name__):
     logger.addHandler(console_handler)
 
     # File Handler
-    if not os.path.exists(Config.LOG_DIR):
-        os.makedirs(Config.LOG_DIR)
-        
-    file_handler = RotatingFileHandler(
-        os.path.join(Config.LOG_DIR, 'app.log'),
-        maxBytes=10*1024*1024, # 10MB
-        backupCount=5
-    )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    log_dir = Config.LOG_DIR
+    log_file = os.path.join(log_dir, 'app.log')
+
+    try:
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+            
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=10*1024*1024, backupCount=5
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except PermissionError:
+        print(f"⚠️ Warning: Could not write to log file {log_file} (Permission Denied). Logging to Console only.")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not setup log file: {e}")
 
     return logger
