@@ -40,6 +40,7 @@ class Config:
     TRUST_CONFIG_FILE = os.path.join(BASE_DIR, 'source_config.json')
     USERS_FILE = os.path.join(DATA_DIR, 'users.json')
     AUDIT_LOG_FILE = os.path.join(DATA_DIR, 'audit_log.json')
+    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL', f"sqlite:///{os.path.join(DATA_DIR, 'app.db')}")
 
     # Auth
     SECRET_KEY = os.getenv('SECRET_KEY', 'change-me-in-production')

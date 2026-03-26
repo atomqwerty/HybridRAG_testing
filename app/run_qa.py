@@ -17,6 +17,27 @@ from app.router import get_route
 
 logger = setup_logger(__name__)
 
+
+# ── Live RAG Config ─────────────────────────────────────────────────
+_RAG_CONFIG_DEFAULTS = {
+    "k": 10, "k_keyword": 15, "min_score": 0.50, "top_k_rerank": 10, "multi_query": True
+}
+
+def get_rag_config(is_draft=False) -> dict:
+    """Reads the current RAG tuning params from SQLite (1=Live, 2=Draft)."""
+    try:
+        from app.db import get_session as _gs, init_db as _init
+        from app.models import RagConfig as _RC
+        _init()
+        config_id = "2" if is_draft else "1"
+        with _gs() as s:
+            cfg = s.query(_RC).filter(_RC.id == config_id).first()
+            if cfg:
+                return cfg.to_dict()
+    except Exception as e:
+        logger.warning(f"[get_rag_config] DB read failed for id={config_id if 'config_id' in locals() else 'unknown'}: {e}")
+    return _RAG_CONFIG_DEFAULTS.copy()
+
 def preprocess_thai_query(query: str) -> str:
     """Tokenizes Thai text for better Lucene search."""
     try:
@@ -273,28 +294,37 @@ def reciprocal_rank_fusion(results_lists, k=60):
     reranked_results.sort(key=lambda x: x['rrf_score'], reverse=True)
     return reranked_results
 
-def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact", selected_sources=None):
+def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact", selected_sources=None, is_draft=False):
     """Combines Graph, Vector, and Keyword context. Adapts to Route."""
     selected_sources = selected_sources or []
     create_fulltext_index(graph)
     create_chunk_fulltext_index(graph)
-    
+
+    # Load live/draft RAG config
+    rag_cfg = get_rag_config(is_draft=is_draft)
+    base_k_vec     = rag_cfg["k"]
+    base_k_keyword = rag_cfg["k_keyword"]
+    min_score      = rag_cfg["min_score"]
+    top_k_rerank   = rag_cfg["top_k_rerank"]
+    use_multi_query = rag_cfg["multi_query"]
+    logger.info(f"[RAG Config] id={rag_cfg.get('id')} k={base_k_vec} k_kw={base_k_keyword} min_score={min_score} top_k_rerank={top_k_rerank} multi_query={use_multi_query}")
+
     # Detect Brand-Only or short queries (Higher Recall needed)
     is_broad_query = len(question.strip().split()) <= 2 or any(b.lower() in question.lower() for b in ['xpeng', 'byd', 'tesla', 'audi', 'zeekr'])
-    
+
     # 1. GRAPH SEARCH (Boosted if deep_reasoning or broad query)
     graph_limit = 40 if (route == "deep_reasoning" or is_broad_query) else 15
     graph_ctx = retrieve_graph_context(graph, llm_model, question, limit=graph_limit)
 
     # 2. HYBRID SEARCH
-    k_res = 20 if is_broad_query else 15
+    k_res = int(base_k_keyword * 1.3) if is_broad_query else base_k_keyword
     keyword_ctx = keyword_retrieve(graph, question, k=k_res, selected_sources=selected_sources)
     logger.info(f"📊 Keyword Retrieval: {len(keyword_ctx)} results")
-    
+
     # Vector Search (Multi-Query)
     queries_to_run = [question]
-    # Only multi-query if NOT visual (visual needs precise single query usually)
-    if route != "visual_layout":
+    # Only multi-query if NOT visual and config allows it
+    if route != "visual_layout" and use_multi_query:
         try:
             if len(question) > 10 and llm_model:
                  alt_prompt = f"Generate 2 alternative search queries for: '{question}'. Return only comma-separated strings."
@@ -306,16 +336,15 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
 
     vector_results_map = {}
     for q in queries_to_run:
-        # Pass route to vector_retrieve for boosting
-        k_vec = 15 if is_broad_query else 10
-        res = vector_retrieve(graph, embeddings, q, k=k_vec, min_score=0.50, route=route, selected_sources=selected_sources)
+        k_vec = int(base_k_vec * 1.5) if is_broad_query else base_k_vec
+        res = vector_retrieve(graph, embeddings, q, k=k_vec, min_score=min_score, route=route, selected_sources=selected_sources)
         for r in res:
-            vector_results_map[r['text']] = r 
-            
+            vector_results_map[r['text']] = r
+
     vector_ctx = list(vector_results_map.values())
     vector_ctx.sort(key=lambda x: x.get('score', 0), reverse=True)
     logger.info(f"📊 Vector Retrieval: {len(vector_ctx)} results")
-    
+
     combined_results = reciprocal_rank_fusion([keyword_ctx, vector_ctx])
     vector_ctx = combined_results
     logger.info(f"📊 After RRF Fusion: {len(vector_ctx)} results")
@@ -326,13 +355,13 @@ def hybrid_context(graph, embeddings, question: str, llm_model, route="fast_fact
         is_img_file = lambda r: r.get('source', '').lower().endswith(('.jpg', '.jpeg', '.png'))
         image_file_results = [r for r in vector_ctx if is_img_file(r)]
         text_results = [r for r in vector_ctx if not is_img_file(r)]
-        
+
         # Merge back for reranking
         vector_ctx = text_results + image_file_results
-        
-        reranked = rerank_results(question, vector_ctx, top_k=10, method=Config.RERANKER_METHOD, llm_model=llm_model)
+
+        reranked = rerank_results(question, vector_ctx, top_k=top_k_rerank, method=Config.RERANKER_METHOD, llm_model=llm_model)
         vector_ctx = reranked
-        logger.info(f"📊 After Reranking (top_k=10): {len(vector_ctx)} results")
+        logger.info(f"📊 After Reranking (top_k={top_k_rerank}): {len(vector_ctx)} results")
         if vector_ctx:
             logger.info(f"📄 First result preview: {vector_ctx[0]['text'][:300]}...")
 
@@ -502,9 +531,13 @@ def _rerank_with_cross_encoder(question, results, top_k=3):
         logger.error(f"Cross-encoder reranking failed: {e}")
         return results[:top_k]
 
-def answer(question, history="", temperature=0.3, selected_sources=None):
+def answer(question, history="", temperature=0.3, selected_sources=None, is_draft=False):
     """Final QA function using LCEL."""
-    logger.info(f"Thinking about: {question}")
+    logger.info(f"Thinking about: {question} (draft={is_draft})")
+    
+    # Load config to get system prompt
+    rag_cfg = get_rag_config(is_draft=is_draft)
+    custom_system_prompt = rag_cfg.get("system_prompt")
     
     dynamic_llm = ChatOpenAI(
         api_key=Config.OPENAI_API_KEY,
@@ -544,13 +577,13 @@ def answer(question, history="", temperature=0.3, selected_sources=None):
     if not graph:
         return {"result": "⚠️ System Initializing... Please wait 5 seconds and try again.", "context": ""}
 
-    context = hybrid_context(graph, get_embeddings(), standalone_question, llm_model=dynamic_llm, route=route, selected_sources=selected_sources)
+    context = hybrid_context(graph, get_embeddings(), standalone_question, llm_model=dynamic_llm, route=route, selected_sources=selected_sources, is_draft=is_draft)
     
     logger.debug(f"Retrieved context length: {len(context)} chars")
     
     
     # CRITICAL INSTRUCTION AT THE TOP:
-    template = """You are an intelligent Thai AI assistant (Hybrid RAG).
+    default_template = """You are an intelligent Thai AI assistant (Hybrid RAG).
     
     # 1. AMBIGUITY CHECK (Execute in Order):
     
@@ -594,7 +627,14 @@ def answer(question, history="", temperature=0.3, selected_sources=None):
     - If the user's intent is unclear, ask for clarification (e.g. "หมายถึงรุ่นไหนครับ?").
     - Be polite and professional.
     """
-    prompt = ChatPromptTemplate.from_template(template)
+    
+    final_template = custom_system_prompt if custom_system_prompt else default_template
+    # Ensure variables are present if custom prompt is used
+    if "{context}" not in final_template: final_template += "\n\nContext:\n{context}"
+    if "{question}" not in final_template: final_template += "\n\nQuestion: {question}"
+    if "{history}" not in final_template: final_template += "\n\nHistory: {history}"
+
+    prompt = ChatPromptTemplate.from_template(final_template)
     final_chain = (prompt | dynamic_llm | StrOutputParser())
     
     response = final_chain.invoke({

@@ -32,3 +32,4 @@ magic-pdf[full]>=0.10.0
 langchain-neo4j
 pythainlp
 bert-score
+SQLAlchemy>=2.0.0

@@ -94,6 +94,7 @@ def text_agent():
         query = data.get('query', '')
         session_id = data.get('session_id', 'default')
         temperature = float(data.get('temperature', 0.0))
+        is_draft = data.get('is_draft', False)
         if not query:
             return jsonify({"error": "query is required"}), 400
 
@@ -102,7 +103,7 @@ def text_agent():
         history = ChatService.get_history(session_id)
 
         from app.agents.text_agent import run
-        result = run(query, history=history, temperature=temperature)
+        result = run(query, history=history, temperature=temperature, is_draft=is_draft)
 
         # Update history
         ChatService.update_history(session_id, query, result.get("result", ""))
@@ -125,11 +126,12 @@ def agent_chat():
         message = data.get('message', '')
         session_id = data.get('session_id', 'default')
         temperature = float(data.get('temperature', 0.0))
+        is_draft = data.get('is_draft', False)
         if not message:
             return jsonify({"error": "message is required"}), 400
 
         from app.services.chat_service import ChatService
-        result = ChatService.process_message(message, session_id, temperature)
+        result = ChatService.process_message(message, session_id, temperature, is_draft=is_draft)
         return jsonify(result), 200
     except Exception as e:
         logger.error(f"[Agent API] /agent/chat error: {e}")

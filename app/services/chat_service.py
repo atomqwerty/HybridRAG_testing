@@ -2,7 +2,6 @@ import os
 import re
 import json
 import logging
-import threading
 from typing import List, Dict, Generator
 from app.config import Config
 from app.run_qa import answer
@@ -14,42 +13,37 @@ logger = logging.getLogger(__name__)
 class ChatService:
     """Service to handle chat interactions, history, and multi-agent orchestration."""
 
-    _sessions = {}
-    _lock = threading.Lock()  # protect concurrent session saves
-
-    @classmethod
-    def load_sessions(cls):
-        if os.path.exists(Config.SESSION_FILE):
-            try:
-                with open(Config.SESSION_FILE, 'r') as f:
-                    cls._sessions = json.load(f)
-                logger.info(f"Loaded {len(cls._sessions)} sessions.")
-            except Exception as e:
-                logger.error(f"Failed to load sessions: {e}")
-                cls._sessions = {}
-
-    @classmethod
-    def save_sessions(cls):
-        with cls._lock:
-            try:
-                with open(Config.SESSION_FILE, 'w') as f:
-                    json.dump(cls._sessions, f, indent=4)
-            except Exception as e:
-                logger.error(f"Failed to save sessions: {e}")
-
     @classmethod
     def get_history(cls, session_id: str) -> str:
-        return cls._sessions.get(session_id, "")
+        """Reads the last 20 message pairs from SQLite for this session as a plain-text string."""
+        try:
+            from app.db import get_session as db_get_session, init_db
+            from app.models import ChatMessage
+            init_db()
+            with db_get_session() as session:
+                msgs = (
+                    session.query(ChatMessage)
+                    .filter(ChatMessage.session_id == session_id)
+                    .order_by(ChatMessage.timestamp.asc())
+                    .limit(40)  # 20 pairs
+                    .all()
+                )
+                history = ""
+                for m in msgs:
+                    prefix = "User" if m.role == "user" else "Bot"
+                    history += f"{prefix}: {m.content}\n"
+                return history
+        except Exception as e:
+            logger.warning(f"[ChatService] Could not load history from DB: {e}")
+            return ""
 
     @classmethod
     def update_history(cls, session_id: str, user_msg: str, bot_msg: str):
-        if session_id not in cls._sessions:
-            cls._sessions[session_id] = ""
-        cls._sessions[session_id] += f"User: {user_msg}\nBot: {bot_msg}\n"
-        cls.save_sessions()
+        """No-op: history is persisted by the frontend via POST /api/chat/history."""
+        pass
 
     @classmethod
-    def process_message(cls, message: str, session_id: str = "default", temperature: float = 0.0, selected_sources: List[str] = None) -> Dict:
+    def process_message(cls, message: str, session_id: str = "default", temperature: float = 0.0, selected_sources: List[str] = None, is_draft: bool = False) -> Dict:
         """
         Multi-Agent orchestration:
           1. Supervisor classifies intent → visual | table | text
@@ -84,7 +78,7 @@ class ChatService:
 
             else:
                 from app.agents.text_agent import run as text_run
-                output = text_run(sub_query, history=history, temperature=temperature, selected_sources=selected_sources)
+                output = text_run(sub_query, history=history, temperature=temperature, selected_sources=selected_sources, is_draft=is_draft)
 
         except Exception as e:
             logger.error(f"[ChatService] Multi-agent dispatch failed: {e}. Falling back to legacy answer().")
@@ -92,7 +86,7 @@ class ChatService:
 
         # --- Legacy fallback ---
         if output is None:
-            raw = answer(message, history=history, temperature=temperature, selected_sources=selected_sources)
+            raw = answer(message, history=history, temperature=temperature, selected_sources=selected_sources, is_draft=is_draft)
             images, sources = cls._parse_artifacts(raw.get("context", ""))
             output = {
                 "result": raw.get("result", ""),
@@ -114,7 +108,7 @@ class ChatService:
         }
 
     @classmethod
-    def process_stream(cls, message: str, session_id: str = "default", temperature: float = 0.0, selected_sources: List[str] = None) -> Generator[str, None, None]:
+    def process_stream(cls, message: str, session_id: str = "default", temperature: float = 0.0, selected_sources: List[str] = None, is_draft: bool = False) -> Generator[str, None, None]:
         """
         Streaming response with full Supervisor routing and "thought" updates.
 
@@ -190,7 +184,7 @@ class ChatService:
 
         # --- 2b. Text: true LLM streaming ---
         else:
-            for chunk_str in answer_stream(sub_query, history, temperature=temperature, selected_sources=selected_sources):
+            for chunk_str in answer_stream(sub_query, history, temperature=temperature, selected_sources=selected_sources, is_draft=is_draft):
                 try:
                     c = _json.loads(chunk_str)
                     if c.get("type") == "meta":
@@ -236,5 +230,3 @@ class ChatService:
         return final_images, valid_sources
 
 
-# Load sessions on module import
-ChatService.load_sessions()

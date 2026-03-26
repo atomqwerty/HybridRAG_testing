@@ -15,7 +15,7 @@ logger = setup_logger(__name__)
 class TextAgent:
     """Delegates to the existing `answer()` function in run_qa.py."""
 
-    def run(self, query: str, history: str = "", temperature: float = 0.0, selected_sources: list = None) -> dict:
+    def run(self, query: str, history: str = "", temperature: float = 0.0, selected_sources: list = None, is_draft: bool = False) -> dict:
         """
         Args:
             query:       The user's question (may be pre-optimized by Supervisor).
@@ -32,7 +32,7 @@ class TextAgent:
             }
         """
         try:
-            output = answer(query, history=history, temperature=temperature, selected_sources=selected_sources)
+            output = answer(query, history=history, temperature=temperature, selected_sources=selected_sources, is_draft=is_draft)
             result = output.get("result", "")
             context = output.get("context", "")
 
@@ -84,5 +84,5 @@ class TextAgent:
 _text_agent = TextAgent()
 
 
-def run(query: str, history: str = "", temperature: float = 0.0, selected_sources: list = None) -> dict:
-    return _text_agent.run(query, history, temperature, selected_sources=selected_sources)
+def run(query: str, history: str = "", temperature: float = 0.0, selected_sources: list = None, is_draft: bool = False) -> dict:
+    return _text_agent.run(query, history, temperature, selected_sources=selected_sources, is_draft=is_draft)

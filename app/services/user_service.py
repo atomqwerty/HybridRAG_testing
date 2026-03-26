@@ -1,5 +1,5 @@
 """
-app/services/user_service.py — User management backed by data/users.json.
+app/services/user_service.py — User management backed by SQLite (SQLAlchemy).
 """
 
 import os
@@ -9,6 +9,9 @@ from datetime import datetime, timezone
 from app.config import Config
 from app.auth import hash_password, verify_password
 from app.logger import setup_logger
+from app.db import get_session, init_db
+from app.models import User
+from sqlalchemy.exc import IntegrityError
 
 logger = setup_logger(__name__)
 
@@ -23,40 +26,57 @@ VALID_ROLES = {'user', 'admin', 'superadmin'}
 
 class UserService:
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _load() -> list[dict]:
+    @classmethod
+    def _migrate_from_json(cls):
+        """One-time migration from users.json to SQLite. Runs only if the file exists."""
         path = Config.USERS_FILE
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         if not os.path.exists(path):
-            return []
+            return
+
+        logger.info(f"Found legacy users.json at {path}. Migrating to SQLite...")
         try:
             with open(path, 'r') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            return []
+                legacy_users = json.load(f)
 
-    @staticmethod
-    def _save(users: list[dict]) -> None:
-        path = Config.USERS_FILE
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'w') as f:
-            json.dump(users, f, indent=2)
+            with get_session() as session:
+                for lu in legacy_users:
+                    exists = session.query(User).filter_by(username=lu['username']).first()
+                    if not exists:
+                        session.add(User(
+                            id=lu.get('id', str(uuid.uuid4())),
+                            username=lu['username'],
+                            password_hash=lu['password_hash'],
+                            role=lu['role'],
+                            created_at=datetime.fromisoformat(lu['created_at'])
+                                if 'created_at' in lu else datetime.now(timezone.utc),
+                        ))
+
+            # Rename so we never migrate twice
+            os.rename(path, path + ".bak")
+            logger.info("✅ User migration complete.")
+        except Exception as e:
+            logger.error(f"Failed to migrate users from JSON: {e}")
 
     @classmethod
     def _ensure_seed(cls) -> None:
-        """Create default superadmin if no users exist."""
-        users = cls._load()
-        if not users:
-            logger.info('No users found — seeding default superadmin account (admin/admin).')
-            cls.create(
-                username=_DEFAULT_ADMIN['username'],
-                password=_DEFAULT_ADMIN['password'],
-                role=_DEFAULT_ADMIN['role'],
-            )
+        """Idempotent: create DB tables and seed default superadmin if empty."""
+        init_db()
+        cls._migrate_from_json()
+
+        with get_session() as session:
+            if session.query(User).count() == 0:
+                logger.info("No users found — seeding default superadmin (admin/admin).")
+                # Call create() outside the session to avoid nesting sessions
+                pass  # handled below
+
+        # Check again outside so create() can open its own session
+        with get_session() as session:
+            if session.query(User).count() == 0:
+                cls.create(
+                    username=_DEFAULT_ADMIN['username'],
+                    password=_DEFAULT_ADMIN['password'],
+                    role=_DEFAULT_ADMIN['role'],
+                )
 
     # ------------------------------------------------------------------
     # Public API
@@ -65,84 +85,88 @@ class UserService:
     @classmethod
     def get_all(cls) -> list[dict]:
         cls._ensure_seed()
-        return [cls._safe(u) for u in cls._load()]
+        with get_session() as session:
+            return [u.to_dict() for u in session.query(User).all()]
 
     @classmethod
     def get_by_id(cls, user_id: str) -> dict | None:
-        for u in cls._load():
-            if u['id'] == user_id:
-                return cls._safe(u)
-        return None
+        with get_session() as session:
+            user = session.get(User, user_id)  # SQLAlchemy 2.0 API
+            return user.to_dict() if user else None
 
     @classmethod
     def get_by_username(cls, username: str) -> dict | None:
-        """Returns full user record including password_hash (for auth only)."""
-        for u in cls._load():
-            if u['username'].lower() == username.lower():
-                return u
-        return None
+        """Returns full record including password_hash (for auth only)."""
+        with get_session() as session:
+            user = session.query(User).filter(User.username.ilike(username)).first()
+            if not user:
+                return None
+            # Serialize inside session while the object is still attached
+            return {
+                "id": user.id,
+                "username": user.username,
+                "password_hash": user.password_hash,
+                "role": user.role,
+                "created_at": user.created_at.isoformat() if user.created_at else None,
+            }
 
     @classmethod
     def authenticate(cls, username: str, password: str) -> dict | None:
-        """Returns safe user dict if credentials match, else None."""
+        """Returns a safe (no password_hash) user dict on success, else None."""
         cls._ensure_seed()
-        user = cls.get_by_username(username)
-        if user and verify_password(password, user['password_hash']):
-            return cls._safe(user)
+        user_record = cls.get_by_username(username)
+        if user_record and verify_password(password, user_record['password_hash']):
+            return {k: v for k, v in user_record.items() if k != 'password_hash'}
         return None
 
     @classmethod
     def create(cls, username: str, password: str, role: str = 'user') -> dict:
         if role not in VALID_ROLES:
             raise ValueError(f'Invalid role: {role}. Must be one of {VALID_ROLES}')
-        users = cls._load()
-        if any(u['username'].lower() == username.lower() for u in users):
+
+        new_user = User(
+            username=username,
+            password_hash=hash_password(password),
+            role=role,
+        )
+
+        try:
+            with get_session() as session:
+                session.add(new_user)
+                session.flush()  # assigns defaults (id, created_at) before commit
+                result = new_user.to_dict()  # serialise while still attached
+            logger.info(f"Created user: {username} (role={role})")
+            return result
+        except IntegrityError:
             raise ValueError(f'Username "{username}" already exists')
-        user = {
-            'id': str(uuid.uuid4()),
-            'username': username,
-            'password_hash': hash_password(password),
-            'role': role,
-            'created_at': datetime.now(timezone.utc).isoformat(),
-        }
-        users.append(user)
-        cls._save(users)
-        logger.info(f'Created user: {username} (role={role})')
-        return cls._safe(user)
 
     @classmethod
     def delete(cls, user_id: str) -> bool:
-        users = cls._load()
-        before = len(users)
-        users = [u for u in users if u['id'] != user_id]
-        if len(users) == before:
-            return False
-        cls._save(users)
+        with get_session() as session:
+            user = session.get(User, user_id)
+            if not user:
+                return False
+            session.delete(user)
         return True
 
     @classmethod
     def change_role(cls, user_id: str, new_role: str) -> dict | None:
         if new_role not in VALID_ROLES:
             raise ValueError(f'Invalid role: {new_role}')
-        users = cls._load()
-        for u in users:
-            if u['id'] == user_id:
-                u['role'] = new_role
-                cls._save(users)
-                return cls._safe(u)
-        return None
+
+        with get_session() as session:
+            user = session.get(User, user_id)
+            if not user:
+                return None
+            user.role = new_role
+            session.flush()
+            return user.to_dict()  # serialise while attached
 
     @classmethod
     def change_password(cls, user_id: str, new_password: str) -> bool:
-        users = cls._load()
-        for u in users:
-            if u['id'] == user_id:
-                u['password_hash'] = hash_password(new_password)
-                cls._save(users)
-                return True
-        return False
-
-    @staticmethod
-    def _safe(user: dict) -> dict:
-        """Strip password_hash before returning to caller."""
-        return {k: v for k, v in user.items() if k != 'password_hash'}
+        with get_session() as session:
+            user = session.get(User, user_id)
+            if not user:
+                return False
+            user.password_hash = hash_password(new_password)
+        return True

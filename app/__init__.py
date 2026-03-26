@@ -6,6 +6,7 @@ from app.api.file_routes import api as file_bp
 from app.api.crawl_routes import api as crawl_bp
 from app.api.agent_routes import api as agent_bp
 from app.api.auth_routes import api as auth_bp
+from app.api.config_routes import api as config_bp
 import logging
 import os
 
@@ -25,6 +26,7 @@ def create_app():
     app.register_blueprint(file_bp, url_prefix='/api')
     app.register_blueprint(crawl_bp, url_prefix='/api')
     app.register_blueprint(agent_bp, url_prefix='/api')
+    app.register_blueprint(config_bp, url_prefix='/api')
 
     # Seed default admin on startup
     from app.services.user_service import UserService

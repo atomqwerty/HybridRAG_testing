@@ -19,8 +19,8 @@ services:
       - OPENAI_EMBEDDING_BASE_URL=${OPENAI_EMBEDDING_BASE_URL:-https://aigateway.ntictsolution.com/v1}
       - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-2560}
       - OCR_API_KEY=${OCR_API_KEY}
-    volumes:
-      - .:/app
+#    volumes:
+#      - .:/app
     depends_on:
       - neo4j
     restart: always

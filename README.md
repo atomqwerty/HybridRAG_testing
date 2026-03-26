@@ -31,7 +31,38 @@
 
 ---
 
-## 🛠️ การติดตั้ง (Installation)
+## ⚡ Quick Setup & Start Guide (เริ่มใช้งานด่วน)
+
+ทำตาม 4 ขั้นตอนง่ายๆ เพื่อรันระบบ Hybrid RAG ทั้งหมดบนเครื่องของคุณ:
+
+**1. เปิดฐานข้อมูล (Database)**
+```bash
+docker compose up -d
+```
+
+**2. ตั้งค่า Backend & API**
+ใส่คีย์ `OpenAi_api` และข้อมูลเชื่อมต่อ `Neo4j` ในไฟล์ `.env` (ดูได้ที่หัวข้อ การตั้งค่า) จากนั้นรัน:
+```bash
+pip install -r requirements.txt
+python api.py
+```
+*(API จะเปิดทำงานที่ `http://localhost:5000`)*
+
+**3. เปิดใช้งาน Frontend (หน้าเว็บ)**
+เปิด Terminal หน้าต่างใหม่ และรัน:
+```bash
+cd frontend
+npm install
+npm start
+```
+
+**4. เริ่มต้นใช้งานได้ทันที!**
+* เปิดเว็บเบราว์เซอร์ไปที่ `http://localhost:3000`
+* ล็อกอินบัญชีแอดมินเริ่มต้น: **Username**: `admin` | **Password**: `admin`
+
+---
+
+## 🛠️ การติดตั้ง (Installation) แบบละเอียด
 
 ### 1. ติดตั้ง Neo4j
 **ใช้ Docker-compose.yml สำหรับการติดตั้ง:**
